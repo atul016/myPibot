@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenBot memory (Basic Memory MCP server indexing state/mind/ -- search for the mind and conversations)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+EnvironmentFile=/etc/openbot/openbot.env
+Environment=BASIC_MEMORY_NO_PROMOS=1
+# Localhost only: the markdown files are the source of truth; this just indexes + searches them.
+ExecStart=@HOME@/.local/bin/basic-memory mcp --transport streamable-http --host 127.0.0.1 --port 8765 --project @PROJECT@
+Restart=always
+# CPU priority: speech-to-text (wake-listen, Nice=0) must win -- re-indexing the journal is background work.
+Nice=15
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

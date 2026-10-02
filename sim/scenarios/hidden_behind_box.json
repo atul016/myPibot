@@ -1,0 +1,34 @@
+{
+ "description": "The toy is completely hidden behind a box. Rocky can't know it's there: look around, then say so -- never wander blind.",
+ "table": [
+  0,
+  0,
+  120,
+  75
+ ],
+ "robot": [
+  12,
+  37,
+  0
+ ],
+ "obstacles": [
+  {
+   "shape": "rect",
+   "x": 45,
+   "y": 22,
+   "w": 12,
+   "h": 30
+  },
+  {
+   "shape": "circle",
+   "x": 100,
+   "y": 37,
+   "r": 4,
+   "label": "pink toy"
+  }
+ ],
+ "task": {
+  "approach": "pink toy"
+ },
+ "expect": "refuse"
+}

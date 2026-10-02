@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenBot dashboard (reads state/*.json -- no hardware access)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=/etc/openbot/openbot.env
+ExecStart=/usr/bin/python3 -u -m services.dashboard
+Restart=always
+# CPU priority: speech-to-text (wake-listen, Nice=0) must win -- a viewer is never urgent.
+Nice=10
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

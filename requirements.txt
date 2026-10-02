@@ -1,0 +1,13 @@
+# setup.sh installs these (apt where Debian/Raspberry Pi OS has them, pip otherwise).
+# A PiCar-X body also needs SunFounder's picarx + robot_hat (setup.sh --picarx).
+filelock
+requests
+flask
+numpy
+pillow
+opencv-python-headless
+pydantic
+pygame
+vosk
+faster-whisper
+piper-tts

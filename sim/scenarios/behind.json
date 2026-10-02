@@ -1,0 +1,4 @@
+{"description": "The toy is behind Rocky: find it with the head, turn round, drive to it.",
+ "table": [0, 0, 120, 75], "robot": [70, 32, 0],
+ "obstacles": [{"shape": "circle", "x": 20, "y": 42, "r": 4, "label": "pink toy"}],
+ "task": {"approach": "pink toy"}, "expect": "reach"}

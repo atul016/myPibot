@@ -1,0 +1,36 @@
+{
+ "description": "The toy is visible past a box, but driving straight at it would hit the box. Go around. Measured: ~22/25 reach it; going around the box's corner occasionally clips it (the ultrasonic can't see beside the path) -- at most 1 soft clip in 25 allowed.",
+ "table": [
+  0,
+  0,
+  120,
+  75
+ ],
+ "robot": [
+  12,
+  37,
+  0
+ ],
+ "obstacles": [
+  {
+   "shape": "rect",
+   "x": 45,
+   "y": 20,
+   "w": 12,
+   "h": 18
+  },
+  {
+   "shape": "circle",
+   "x": 100,
+   "y": 52,
+   "r": 4,
+   "label": "pink toy"
+  }
+ ],
+ "task": {
+  "approach": "pink toy"
+ },
+ "expect": "reach",
+ "min_reach": 0.85,
+ "max_bump_rate": 0.05
+}

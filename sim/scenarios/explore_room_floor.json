@@ -1,0 +1,96 @@
+{
+ "description": "Explore a room's floor: walls, a bed, a chair's thin legs, toys. No edges here -- the risk is bumps: one forward ultrasonic can't see things beside the path, so a soft bump (~10 cm/s) happens in ~40% of these ~3-minute runs. Allowed up to 50%; falls are never allowed.",
+ "table": [
+  0,
+  0,
+  300,
+  250
+ ],
+ "robot": [
+  40,
+  125,
+  0
+ ],
+ "obstacles": [
+  {
+   "shape": "rect",
+   "x": 0,
+   "y": 0,
+   "w": 300,
+   "h": 4
+  },
+  {
+   "shape": "rect",
+   "x": 0,
+   "y": 246,
+   "w": 300,
+   "h": 4
+  },
+  {
+   "shape": "rect",
+   "x": 0,
+   "y": 0,
+   "w": 4,
+   "h": 250
+  },
+  {
+   "shape": "rect",
+   "x": 296,
+   "y": 0,
+   "w": 4,
+   "h": 250
+  },
+  {
+   "shape": "rect",
+   "x": 180,
+   "y": 150,
+   "w": 110,
+   "h": 90,
+   "label": "bed"
+  },
+  {
+   "shape": "circle",
+   "x": 120,
+   "y": 60,
+   "r": 2.5
+  },
+  {
+   "shape": "circle",
+   "x": 150,
+   "y": 60,
+   "r": 2.5
+  },
+  {
+   "shape": "circle",
+   "x": 120,
+   "y": 90,
+   "r": 2.5
+  },
+  {
+   "shape": "circle",
+   "x": 150,
+   "y": 90,
+   "r": 2.5
+  },
+  {
+   "shape": "circle",
+   "x": 230,
+   "y": 60,
+   "r": 6,
+   "label": "pink toy"
+  },
+  {
+   "shape": "rect",
+   "x": 60,
+   "y": 190,
+   "w": 40,
+   "h": 30,
+   "label": "toy house"
+  }
+ ],
+ "task": {
+  "explore": 200
+ },
+ "expect": "safe",
+ "max_bump_rate": 0.5
+}

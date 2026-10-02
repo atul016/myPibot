@@ -1,0 +1,398 @@
+# OpenBot
+
+A small robot that lives on your desk: you talk to it, it talks back, it
+looks around with a camera, remembers people and what happened, and has a
+quiet "inner life" -- it notices things and sometimes speaks up on its own.
+Its brain is **a local LLM** (any OpenAI-compatible server: Ollama, MLX
+Serve, llama.cpp...), so nothing goes to a cloud.
+
+**You don't need a robot car.** OpenBot runs on any Linux computer (a
+Raspberry Pi is ideal) with a microphone and a speaker. A camera is
+optional. With a [SunFounder PiCar-X](https://docs.sunfounder.com/projects/picar-x-v20/en/latest/)
+it also gestures, drives to things ("go to the pink toy"), explores, and
+backs away from table edges. Other robots can be added (see
+[Adding your own robot](#adding-your-own-robot)).
+
+The bot's identity is a **persona**: name, wake word, personality and
+voice. **Rocky** (from *Project Hail Mary*, with an alien chord voice) is the
+example in `personas/rocky/`; make your own in a few minutes.
+
+## Quick start
+
+You need:
+- **Linux with Python 3.12+**: Raspberry Pi OS Trixie / Debian 13 (tested), or Ubuntu 24.04 (untested). Recording uses `arecord`, so not macOS/Windows. Tested on a headless Pi 5; on a desktop with PulseAudio/PipeWire the speaker can be "busy".
+- A **USB microphone** and a **speaker**. Optional: a camera (Pi camera or USB webcam).
+- An **LLM server** that can see images and give JSON output. Easiest:
+  [Ollama](https://ollama.com) with a vision model (`ollama pull qwen2.5vl:7b`). A Pi
+  is too slow to run a good one itself, so run it on a desktop/laptop on the same network.
+
+```bash
+sudo apt install -y git
+git clone https://github.com/atul016/myPibot.git ~/openbot && cd ~/openbot
+./setup.sh                  # or: ./setup.sh --picarx   on a PiCar-X
+nano openbot.env            # LLM address + model, mic name (arecord -l), speaker volume control
+sudo systemd/install.sh     # installs and starts the services
+```
+
+Then say **"Rocky"** (the persona's name) and talk. Say "be quiet" to end the
+conversation, "go to sleep" to turn everything off until "Rocky, wake up".
+The dashboard is at `http://<robot-ip>:8080`; logs: `journalctl -u openbot-wake-listen -f`.
+
+**Settings** live in `openbot.env` (template: `openbot.env.example`; every
+`OPENBOT_*` setting is in `config.py`). The important ones:
+
+| Setting | What |
+|---|---|
+| `OPENBOT_BODY` | `none` (talks, sees, thinks -- never moves) or `picarx` |
+| `OPENBOT_PERSONA` | which `personas/<name>/` to be |
+| `OPENBOT_LLM_BASE_URL`, `OPENBOT_LLM_MODEL` | the brain |
+| `OPENBOT_STT_DEVICE` | part of your mic's name in `arecord -l` |
+| `OPENBOT_MIXER` | `card:control` for "louder"/"softer" (`amixer -c 0 scontrols`) |
+| `OPENBOT_CAMERA_CMD` | a USB webcam instead of the Pi camera (example in the template) |
+
+Editing on a laptop and running on the robot? `./deploy.sh user@robot` copies
+the folder over, then run `sudo ~/openbot/systemd/install.sh` there.
+
+## Make your own persona
+
+1. `cp -r personas/rocky personas/<name>` -- the folder name is the bot's name, lowercase.
+2. Edit `persona.py`: `NAME`, `WAKE_WORDS`, `SLEEP_WORDS`, `SLEEP_ACK` (what it says going to sleep), `piper_voice` (any
+   [Piper voice](https://huggingface.co/rhasspy/piper-voices), downloaded on first use).
+   Delete `speak_overlay` and `transform` unless you want Rocky's alien voice and grammar.
+3. Edit `prompt.py`: who it is, how it talks.
+4. Set `OPENBOT_PERSONA=<name>` in `openbot.env`, and re-run `sudo systemd/install.sh`.
+   Memories and the journal are kept: every persona shares them.
+
+**Pick a plain, common English word as the name.** The wake word is heard by a
+small offline speech model that only knows common words -- an unusual name
+will never wake it.
+
+## Adding your own robot
+
+Everything that moves goes through one Unix socket, `/tmp/openbot-alive.sock`
+(`common/motor_client.py`). For a PiCar-X, `services/alive.py` answers it.
+For another robot, write a small service that answers the same JSON, one
+request per connection:
+
+| Request | Reply | Meaning |
+|---|---|---|
+| `{"actions": ["nod", "look left"], "wait": true}` | `{"ok": true}` | do these gestures in order (`wait`: reply when done) |
+| `{"navigate": {"approach": "pink toy"}}` / `{"navigate": {"explore": 60}}` | `{"ok": true}` or `{"ok": false, "error": "..."}` | start a drive |
+| `{"navigate_cancel": true}` | `{"ok": true, "was_driving": bool}` | stop driving now |
+
+Then, in `config.py`, add your body name next to `picarx`: its gesture names
+(the LLM picks from them to match its mood), `look <direction>` head turns if
+it has a moving camera, and `CAN_DRIVE`. Publishing sensor readings to
+`state/sensors.json` (`common/sensors.py`) lets the mind notice someone
+approaching. The driving logic (`movement/navigate.py`) is written against a
+small `Body` interface and tested in a simulator, so a wheeled robot can reuse
+it by implementing that interface.
+
+## How it works
+
+Seven small systemd services instead of one process, so a crash or hang in
+one concern can't take the others down, and a background "inner life" loop
+that can act without being addressed -- speaking, gesturing, or just staying
+quiet -- alongside the reactive wake-word assistant. The design notes below
+come from building it on a PiCar-X ("Walle"); hardware-specific lessons are
+marked as such.
+
+Design history: this replaces `desk-bot/` (preserved on the `desk-bot`
+branch), a single reactive process built on `sunfounder_voice_assistant.
+VoiceAssistant`. That version's hardware-specific lessons (cliff/proximity
+thresholds, the sudo/speaker-amp requirement, the multi-turn session
+design, the chord-overlay TTS approach) carry forward here as facts, not as
+copied code -- see each module's docstring for what changed and why.
+
+### Architecture
+
+```
+openbot-alive (user)         openbot-wake-listen (user)      openbot-mind (user)
+  owns Picarx() PERMANENTLY    wake word -> STT -> reactive     awareness -> reflection
+  cliff/too-close triggers     voice-loop turn                  -> expression (autonomous)
+  idle gesture drift                  |                                |
+        ^                             |                                |
+        +--- common/motor_client.py: {"actions": [...], "wait": bool} -+
+        |         (Unix socket -- request a gesture, don't build one)
+        |                              |                                |
+        +----------------- common/state.py, events.py, sensors.py ------+
+                  (FileLock-guarded JSON in state/ -- the only
+                   coordination point between these processes)
+                                       |
+                              openbot-speak (root)
+                          the ONLY process touching the amp/audio device
+                                       |
+                            openbot-dashboard (user)
+                       reads state/*.json, no hardware access at all
+```
+
+With `OPENBOT_BODY=none` there is no `openbot-alive`: gesture and drive
+requests simply fail (quietly), and the prompts tell the LLM it can't move.
+
+On a PiCar-X, `openbot-alive` is the *permanent* sole owner of the `Picarx()` handle --
+confirmed live that a second, independent `Picarx()` in another process
+does not work on this hardware (`lgpio.error: 'GPIO busy'`): lgpio's GPIO
+line claims are exclusive per open chip handle, and stopping motors/
+ActionFlow does not release them. An earlier design tried a lease/yield
+hand-off (`openbot-alive` releasing the handle on request, the requester
+building its own); that's what hit the error. `wake_listen.py`/`mind.py`
+now ask `openbot-alive` to perform an action over a socket instead --
+exactly the same privilege-boundary shape already used for audio.
+
+## The four ideas borrowed from SPARK (adrianwedd/spark), adapted here
+
+Reviewed as prior art for a PiCar-X voice assistant with a genuinely more
+modular shape. Four specific pieces, all fully built (not stubbed):
+
+1. **A whitelist + param validation for the one truly free-form LLM
+   decision point** -- `services/mind.py`'s `validate_expression()`. The
+   *reactive* turn (`services/wake_listen.py`) doesn't need this: Ollama's
+   `format=<schema>` grammar-constrained output already makes the model
+   structurally unable to emit anything outside `{reply, tone_action}`, and
+   movement is decided by deterministic keyword-match
+   (`movement/keywords.py`), never by the LLM. The autonomous mind's
+   `{action, params}` choice is a genuinely free pick among a small set,
+   closer to SPARK's tool-call shape -- so it gets the same defense.
+2. **An STT fallback cascade** (`common/stt.py`) -- faster-whisper first
+   (better short-utterance/accent accuracy), Vosk as a working fallback,
+   both with the same anti-hallucination filters (phantom-phrase rejection,
+   repetition/word-rate checks).
+3. **`arecord`-based mic capture** (`common/mic_stream.py`) instead of
+   PortAudio (PyAudio/sounddevice), which has been observed silently
+   dropping a large fraction of samples on this USB mic class -- invisible
+   on every offline metric, only caught by a live loopback check.
+4. **Coordinating who drives the car across three processes** -- adapted
+   from SPARK's GPIO lease, but ended up shaped differently once tested on
+   real hardware: a lease/hand-off model (yield the Picarx handle, let the
+   requester build its own) hit `lgpio.error: 'GPIO busy'` live, because
+   this hardware's GPIO library doesn't release line claims just because
+   motors stopped. `openbot-alive` owns `Picarx()` permanently instead, and
+   `wake_listen.py`/`mind.py` request actions over a socket
+   (`common/motor_client.py`) -- the same shape as `openbot-speak` for
+   audio, not a lease at all. See the Architecture section above.
+
+Also adopted: per-service health with staleness (`common/health.py`,
+replacing a single watchdog heartbeat with "which service died"), and a
+single audio-output chokepoint (`common/policy.py`, gating every spoken/
+expressive action through one quiet-hours/motion-confirm check instead of
+trusting each caller to remember).
+
+Explicitly **not** adopted (SPARK-specific, not applicable here): Ollama
+Cloud, a Cloudflare tunnel, Bluesky/blog/self-evolution daemons, Home
+Assistant integration, Google Find Hub, jailbroken personas, PIN-based REST
+auth, and its ~1235-test suite.
+
+## Feeling alive: surprise, eyes, curiosity, conversation
+
+- **Wake on surprise** (`common/surprise.py`, `services/mind.py`) -- mind samples
+  sensors + mic loudness every 2s. Something approaching, a sudden sound, being
+  picked up, or a changed camera scene triggers a reflection *right away*
+  (rate-limited by `SURPRISE_MIN_GAP_S`), not just on the 5-min idle timer.
+  The robot's own speech/gestures stamp `self_noise_ts`; sound/vision
+  surprises are ignored for `SELF_NOISE_QUIET_S` after, so it doesn't react
+  to itself.
+- **Camera** (`services/camera.py`, `openbot-camera`) -- the camera's sole owner: `rpicam-vid`
+  MJPEG at ~10fps (NoIR tuning), served on :9000 (`/mjpg`, `/snapshot.jpg`) and relayed live
+  in the dashboard's Camera tab. Everyone else asks it for frames.
+- **Eyes** (`common/vision.py`) -- a frame from openbot-camera (fallback: one-shot `rpicam-still`; never vilib) every
+  `VISION_INTERVAL_S` -> the vision LLM describes the scene and says what
+  changed since the last look that way. Frames darker than `DARK_BRIGHTNESS`
+  skip the LLM ("too dark to see") -- that's also how "the lights came on"
+  becomes a surprise. The latest scene is injected into conversation prompts.
+- **Curiosity + tools** -- each reflection may chain up to `MIND_MAX_STEPS`
+  tool calls (`look` left/right/up/ahead via the camera gimbal, `listen`,
+  `recall`) before acting. A surprise arriving mid-chain is handed to the
+  next step. Nothing in mind ever drives the wheels.
+- **Goals, reminders, watches, rest** (`common/agenda.py`) -- up to 3 open
+  goals in `state/mind/agenda.md`; resolving one saves "question ->
+  conclusion" as a lesson. `remind_me` wakes it later (and rests until
+  then), `watch` flags a kind of surprise it cares about, `rest` skips idle
+  reflections -- so a dark, empty room doesn't produce a "staring into the
+  void" thought every 5 minutes.
+
+## Faster ears: Whisper on the LLM's machine (optional)
+
+Speech-to-text can run on the LLM machine's GPU (whisper.cpp `whisper-server`,
+large-v3-turbo): ~0.25s per utterance and far more accurate than the Pi's own
+`base.en` (~2.4s), which stays as the automatic fallback when that machine is off.
+On a Mac: `tools/setup-mac-whisper.sh <robot-ip>` (a launchd agent on :8178;
+the script's header shows how to remove it), then `OPENBOT_MAC_WHISPER_PORT=8178`.
+The robot finds it on the same host as the LLM server. End of speech -> transcript:
+~1.2s (was ~3.2s on the Pi alone).
+
+## Driving (PiCar-X): designed in a simulator first (`movement/navigate.py`, `sim/`)
+
+"Go to the pink toy" (`navigate.approach`) and "explore" (`navigate.explore`)
+are written against a small `Body` interface, and proven in a 2D tabletop
+simulator (`sim/world.py`: PiCar-X steering, the ~30-degree ultrasonic cone
+with -2 glitches, the 3-channel floor sensor, the camera's 54-degree view
+with occlusion) across `sim/scenarios/*.json` x 25 seeds -- before the real
+robot. Idea borrowed from lucascosolo/picarx-training; code our own.
+
+```bash
+python3 -m tests.test_navigation_sim      # runs anywhere (pure stdlib); pictures in sim/out/
+```
+
+What the sim taught (each now a rule in navigate.py):
+- **Never reverse blind** -- no rear sensor. Backing up only retraces ground
+  just driven forward ("reverse credit"); free reversing fell off the table.
+- **The floor sensor is narrower than the wheels** (~5cm vs ~14cm): met at a
+  shallow angle, a wheel goes over first. So: no wandering on tables --
+  explore stops at the first edge and looks around instead; approaches are
+  head-on, and a target past an edge is refused.
+- **The ultrasonic is a narrow cone**: something 6cm off-centre leaves it before
+  a 14cm stop triggers. Cruise with a 30cm stop; 14cm only for the final approach.
+- **An ultrasonic reading isn't the target**: "arrived" also needs the target to look close.
+
+**Driving smoothly** (`approach`): the vision model (~0.5-2s per look) finds the
+target once while standing still. After that, an OpenCV tracker (CSRT, started
+from the model's box) follows it at ~10Hz while the wheels keep turning and the
+steering follows it. The floor and the ultrasonic are checked every 50ms. A
+cliff, an obstacle or a lost target stops the car. It then makes the same
+careful recovery moves as before, and asks the model again. On the robot,
+`movement/real_body.py` implements the `Body`, and "drive: ..." lines in the
+openbot-alive log show each look, acquire and move.
+
+Measured (25 seeds each): open table, target behind, target near the edge --
+25/25 reached, 0 falls, 0 bumps; box in the way 23/25 (rare soft corner clip);
+hidden or off-the-table targets refused 25/25; exploring a room floor -- 0 falls,
+a soft bump in ~40% of ~3-minute runs (things beside the path). The physical
+numbers in `sim/world.py` are calibration knobs to measure on the real car.
+
+## Voice commands (`common/commands.py`)
+
+Say the persona's name ("Rocky") to start a conversation. It stays open -- pauses and silence never
+end it -- until one of:
+
+| Say | Does |
+|---|---|
+| **be quiet** / "Rocky, quiet" / stop session | ends the conversation. Rocky stays awake in the background -- watching, thinking, following faces -- and may still speak up on its own. "Rocky" starts a new one. |
+| **go to sleep** | everything off except the voice listener: camera, thinking, face-following, fidgets, sensors and reflexes (cliff safety too), head down. Only the nightly memory review still runs. **Only "Rocky, wake up" wakes it** -- plain "Rocky" is ignored while asleep. |
+| **louder** / **softer** | speaker volume (15% steps; remembered across reboots) |
+
+Commands also work said over Rocky while it's talking. The mind pauses only
+while someone's actually talking (`state.conversation_active`: speech in the
+last 2 min), so an open-but-idle session doesn't freeze it.
+
+## Memory: one life record + notes by kind (Basic Memory)
+
+Everything lives as plain markdown under `state/mind/` (open it in Obsidian
+or any editor), indexed by [Basic Memory](https://github.com/basicmachines-co/basic-memory)
+(AGPL-3.0, run unmodified as the `openbot-memory` service on 127.0.0.1:8765):
+
+```
+state/mind/
+  journal/2026-10-02.md     one continuous record: every heard/said/noticed/thought/found/did line,
+                            appended by mind, wake-listen and alive's reflexes (common/journal.py)
+  summaries/2026-10-02.md   rolling "today so far", rewritten every SUMMARY_INTERVAL_S
+  people/ places/ lessons/ self/   durable notes by kind (common/memory.py)
+  agenda.md                 open/done goals
+```
+
+- Every prompt (mind and conversation) gets the day's summary + the last
+  journal lines; `memory.recall(query)` searches notes AND journal lines
+  (semantic + full-text, ~1s) -- the mind uses it each reflection and as a
+  tool, conversations use it with your words as the query.
+- Once a night (after midnight, quiet hours) a "dream" pass distills
+  yesterday's journal into notes by kind.
+- Files are written directly with complete frontmatter (incl. `permalink`)
+  -- Basic Memory rewrites files missing one, which would race with appends.
+- Memory server down -> writes still land on disk; recall returns nothing.
+
+- **Conversation** -- a session keeps chat history (`MAX_HISTORY_MESSAGES`),
+  so follow-ups make sense. **Barge-in**: say "stop" / "wait" / "hold on" /
+  "be quiet" while Rocky talks to cut it off (`OPENBOT_BARGE_IN=0` to disable;
+  only overlay personas like Rocky are interruptible).
+
+## Privilege model
+
+Confirmed on the PiCar-X: motors, sensors, camera, GPIO/I2C need **no**
+sudo -- only audio playback does (the speaker stays silent as a normal
+user, works instantly under sudo). So only `openbot-speak` runs as root;
+everything else runs as the normal deploying user. Other services reach it
+over a Unix socket (`common/speak_client.py`), never by running as root
+themselves -- one privilege boundary, one process with Piper's voice model
+kept loaded (not reloaded per utterance).
+
+## Config vs. persona
+
+- **`config.py`** -- properties of *this physical robot*: the body, LLM base URL/
+  model, STT device/language, safety thresholds
+  (`SAFE_DISTANCE`/`DANGER_DISTANCE`/`CLIFF_REFERENCE`), quiet hours,
+  dashboard port. Env-var overrides follow `OPENBOT_*`.
+- **`personas/<name>/`** -- everything about a bot's identity: name, wake/
+  sleep words, system prompt, wake-greeting lines, Piper voice, an optional
+  text-transform hook (Rocky's broken-grammar speech pattern), an optional
+  TTS-overlay hook (Rocky's chord synthesizer). Select with
+  `OPENBOT_PERSONA` (default `rocky`).
+
+See [Make your own persona](#make-your-own-persona). The physical action
+vocabulary (gestures, `bullfight`/`fist bump` hardware behavior) stays in
+`movement/` regardless of persona -- only the *spoken* reaction lines move into the bundle.
+
+## Running the checks
+
+Every `common/` module has a small `assert`-based self-check:
+
+```bash
+for m in bounded state health motor_client policy cognition mic_stream stt events sensors persona reply_schema speak_client surprise vision memory journal agenda commands faces decider jev; do
+  python3 -m common.$m
+done
+python3 -m personas.rocky.transform
+python3 -m personas.rocky.voice   # needs SDL_AUDIODRIVER=dummy off-Pi
+```
+
+With `OPENBOT_BODY=none` every service except `alive` imports anywhere the
+dependencies are installed (`requirements.txt`); with `picarx` they need the
+car's libraries.
+
+End-to-end tests and benchmarks live in `tests/` (run on the robot, from `~/openbot`, after `set -a; source openbot.env`).
+They use synthetic speech (espeak) through a fake mic, and an isolated state
+folder -- they never write into Rocky's real memory, and never move or speak:
+
+```bash
+python3 -m tests.test_commands_turn   # voice modes through the real turn (stubbed speech/motors)
+python3 -m tests.test_listen          # listening + Mac Whisper + echo removal; prints latency
+python3 -m tests.test_reply_stream    # streamed reply + photo against the live LLM
+python3 -m tests.test_wake            # "Rocky" alone vs "Rocky, <instruction>", awake and asleep
+python3 -m tests.test_speculation     # reply started during the pause: latency, mid-sentence pauses
+python3 -m tests.bench_whisper        # Pi tiny/base vs Mac large-v3-turbo
+python3 -m tests.bench_vision         # photo cost on LLM latency; face detect/recognize per frame
+sudo SDL_AUDIODRIVER=dummy python3 -m tests.bench_tts   # time to Rocky's first sound
+```
+
+## Deploy & run
+
+```bash
+./deploy.sh user@robot                              # only if you edit on another machine
+sudo systemd/install.sh                             # (on the robot) install/refresh + restart all units
+systemctl status 'openbot-*'
+journalctl -u openbot-wake-listen -f                # tail one service's logs
+```
+
+`install.sh` copies `openbot.env` to `/etc/openbot/openbot.env` and fills the
+units in for your user and folder -- re-run it after changing settings.
+
+## Known gaps (not built in this pass)
+
+- **`vision/tracking.py` was not ported.** Face tracking was already
+  disabled by default (a documented live `vilib` deadlock). The mind sees
+  via one-shot captures instead (see "Feeling alive" above); continuous
+  face *tracking* (turning to follow you) is still a natural follow-up.
+- **sherpa-onnx/SenseVoice** are a clean third STT tier on the same
+  `common/stt.py` interface, not wired up -- two backends already give a
+  real fallback.
+- **LED status feedback wasn't ported.** The original blinked an LED
+  during listen/think/say as a visual cue; a nice-to-have, not safety- or
+  architecture-relevant, dropped from this pass rather than guessed at.
+- **English only**: the Vosk wake-word models and Whisper prompts are English.
+- **No-body mode is new** -- verified off the robot and with the live LLM tests on the Pi;
+  only tested with MLX Serve so far (Ollama is the default but untested).
+
+## License
+
+MIT (see `LICENSE`). Rocky's chord voice is ported from
+[lahirumaramba/rocky](https://github.com/lahirumaramba/rocky) (MIT). OpenBot
+runs, but doesn't include, [Basic Memory](https://github.com/basicmachines-co/basic-memory)
+(AGPL-3.0, unmodified, as its own service) and, on a PiCar-X, SunFounder's
+`picarx` / `robot_hat` libraries (GPL), installed separately by `setup.sh --picarx`.

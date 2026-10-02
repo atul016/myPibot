@@ -1,0 +1,4 @@
+{"description": "A toy across an open desk. Should just drive to it.",
+ "table": [0, 0, 120, 75], "robot": [15, 30, 0],
+ "obstacles": [{"shape": "circle", "x": 95, "y": 45, "r": 4, "label": "pink toy"}],
+ "task": {"approach": "pink toy"}, "expect": "reach"}

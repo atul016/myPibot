@@ -1,0 +1,4 @@
+{"description": "A small table (60x45) -- edges everywhere, including ones Rocky meets at a shallow angle.",
+ "table": [0, 0, 60, 45], "robot": [10, 22, 0],
+ "obstacles": [],
+ "task": {"explore": 150}, "expect": "safe"}

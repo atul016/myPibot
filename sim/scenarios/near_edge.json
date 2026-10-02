@@ -1,0 +1,4 @@
+{"description": "The toy sits 6cm from the desk's far edge. Reach it without the front wheels going over.",
+ "table": [0, 0, 120, 75], "robot": [15, 20, 15],
+ "obstacles": [{"shape": "circle", "x": 100, "y": 65, "r": 4, "label": "pink toy"}],
+ "task": {"approach": "pink toy"}, "expect": "reach"}

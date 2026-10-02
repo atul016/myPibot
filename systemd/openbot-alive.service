@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenBot alive (PiCar-X body: motors, sensors, safety triggers)
+After=network-online.target openbot-speak.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=/etc/openbot/openbot.env
+ExecStart=/usr/bin/python3 -u -m services.alive
+Restart=always
+# A hung ultrasonic read (no echo) blocks shutdown; nothing to flush, so don't wait the default 90s.
+TimeoutStopSec=10
+RestartSec=5
+NotifyAccess=main
+WatchdogSec=90
+
+[Install]
+WantedBy=multi-user.target

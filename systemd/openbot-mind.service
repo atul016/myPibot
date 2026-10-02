@@ -1,0 +1,21 @@
+[Unit]
+Description=OpenBot mind (autonomous awareness/reflection/expression loop)
+After=network-online.target openbot-memory.service openbot-camera.service openbot-alive.service openbot-speak.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=/etc/openbot/openbot.env
+EnvironmentFile=-/etc/openbot/jev.env
+ExecStart=/usr/bin/python3 -u -m services.mind
+Restart=always
+# CPU priority: speech-to-text (wake-listen, Nice=0) must win -- thinking can wait a beat for listening.
+Nice=5
+RestartSec=5
+NotifyAccess=main
+WatchdogSec=280
+
+[Install]
+WantedBy=multi-user.target

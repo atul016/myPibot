@@ -1,0 +1,21 @@
+[Unit]
+Description=OpenBot wake-listen (wake word -> STT -> reactive voice-loop turn)
+After=network-online.target openbot-memory.service sound.target openbot-alive.service openbot-speak.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=/etc/openbot/openbot.env
+ExecStart=/usr/bin/python3 -u -m services.wake_listen
+# Ollama round trips have been observed taking 30s+, and a custom model can
+# run far slower -- see config.WATCHDOG_STALE_SEC's own comment. Keep this
+# comfortably above WATCHDOG_STALE_SEC + WATCHDOG_PING_INTERVAL.
+Restart=always
+RestartSec=5
+NotifyAccess=main
+WatchdogSec=280
+
+[Install]
+WantedBy=multi-user.target

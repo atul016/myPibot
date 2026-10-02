@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenBot speak (audio chokepoint -- the only process touching the amp)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@DIR@
+EnvironmentFile=/etc/openbot/openbot.env
+ExecStart=/usr/bin/python3 -u -m services.speak
+Restart=always
+# A playback/amp thread can outlive SIGTERM; nothing to flush, so don't wait the default 90s.
+TimeoutStopSec=10
+RestartSec=5
+NotifyAccess=main
+WatchdogSec=90
+
+[Install]
+WantedBy=multi-user.target
