@@ -97,9 +97,8 @@ quiet -- alongside the reactive wake-word assistant. The design notes below
 come from building it on a PiCar-X ("Walle"); hardware-specific lessons are
 marked as such.
 
-Design history: this replaces `desk-bot/` (preserved on the `desk-bot`
-branch), a single reactive process built on `sunfounder_voice_assistant.
-VoiceAssistant`. That version's hardware-specific lessons (cliff/proximity
+Design history: this replaces an earlier "desk-bot", a single reactive
+process built on `sunfounder_voice_assistant.VoiceAssistant`. That version's hardware-specific lessons (cliff/proximity
 thresholds, the sudo/speaker-amp requirement, the multi-turn session
 design, the chord-overlay TTS approach) carry forward here as facts, not as
 copied code -- see each module's docstring for what changed and why.
