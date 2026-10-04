@@ -90,7 +90,7 @@ it by implementing that interface.
 
 ## How it works
 
-Seven small systemd services instead of one process, so a crash or hang in
+Seven small systemd services (eight with WhatsApp) instead of one process, so a crash or hang in
 one concern can't take the others down, and a background "inner life" loop
 that can act without being addressed -- speaking, gesturing, or just staying
 quiet -- alongside the reactive wake-word assistant. The design notes below
@@ -108,8 +108,8 @@ copied code -- see each module's docstring for what changed and why.
 ```
 openbot-alive (user)         openbot-wake-listen (user)      openbot-mind (user)
   owns Picarx() PERMANENTLY    wake word -> STT -> reactive     awareness -> reflection
-  cliff/too-close triggers     voice-loop turn                  -> expression (autonomous)
-  idle gesture drift                  |                                |
+  cliff reflex, near-latches   voice-loop turn                  -> expression (autonomous)
+  head follows faces (gaze)           |                                |
         ^                             |                                |
         +--- common/motor_client.py: {"actions": [...], "wait": bool} -+
         |         (Unix socket -- request a gesture, don't build one)
@@ -173,7 +173,7 @@ modular shape. Four specific pieces, all fully built (not stubbed):
 Also adopted: per-service health with staleness (`common/health.py`,
 replacing a single watchdog heartbeat with "which service died"), and a
 single audio-output chokepoint (`common/policy.py`, gating every spoken/
-expressive action through one quiet-hours/motion-confirm check instead of
+expressive action through one asleep/motion-confirm check instead of
 trusting each caller to remember).
 
 Explicitly **not** adopted (SPARK-specific, not applicable here): Ollama
@@ -201,7 +201,38 @@ auth, and its ~1235-test suite.
 - **Curiosity + tools** -- each reflection may chain up to `MIND_MAX_STEPS`
   tool calls (`look` left/right/up/ahead via the camera gimbal, `listen`,
   `recall`) before acting. A surprise arriving mid-chain is handed to the
-  next step. Nothing in mind ever drives the wheels.
+  next step. The only wheel moves the mind may choose are the fist bump and
+  bullfight nudges (short, cliff-checked); driving anywhere is a spoken command.
+- **Its own drives** (`services/mind.py`) -- besides speaking and gesturing, a reflection may:
+  `go_to` / `explore` (drive to something it sees, or wander -- the same cliff-guarded
+  `movement/navigate.py` as spoken commands; never in the dark), `sleep` on its own when
+  it's dark and quiet with nobody around (or the battery is very low), and `wish` for
+  something it can't do (written to `state/mind/self/wishes.md` -- read it). Its awareness
+  includes code-derived **needs** (battery, dark room, camera trouble), the **people
+  routines** the nightly pass learned, when each person was last seen, the goal to pursue
+  now, and `self/what-works.md`: 3-6 rules it rewrites every night from how people reacted
+  to what it did unprompted.
+- **It starts conversations** -- after the mind speaks, wake-listen listens ~20s for an
+  answer without the wake word; an answer opens a normal session, seeded with what the
+  mind said and where the last conversation (today, yesterday, this week) left off.
+- **Knows which way it's looking** (`services/alive.py` -> `sensors.json` `head`, `common/vision.py`) --
+  the head follows faces and glances about, and people pick the robot up and turn it; without knowing
+  that, it wrote "the room layout shifted again without me moving" 55 times in a day. Now a look is
+  compared only with the last one from about the same head angle (20-degree steps), motion right after
+  its own head moved (or while it's carried) isn't news, and being picked up, set down or driving clears
+  its views and tells it "you may face another way now".
+- **Names what it sees and hears** -- objects (`common/objects.py`: NanoDet, OpenCV's model zoo,
+  every 2 s in openbot-camera: "a person, a chair and a laptop" in every prompt, and grounding each
+  look), sounds (`common/sounds.py`: Google's YAMNet, only the moment the room gets loud: "a sudden
+  sound -- it sounded like: Knock"), and voices (`common/voices.py`: WeSpeaker voice prints, learned
+  like faces -- while it sees exactly one face it knows, that person's words teach it their voice;
+  when no face says who's talking, the voice can). Models: `setup.sh`, into `~/.openbot-models`.
+- **Motion** (`services/camera.py`) -- frame-to-frame change, twice a second, becomes a
+  "something is moving" surprise when sustained (one jump is the head itself turning).
+- **Emotes and a dance** (`movement/actions.py`, after [SPARK](https://github.com/adrianwedd/spark)'s
+  `px-emote`/`px-dance`) -- eased head poses `curious`, `happy`, `excited`, `sad`, `shy` join the
+  preset gestures the LLM picks from; `dance` (a circle, then a figure 8) on "dance for me", and
+  as the mind's own choice only with `OPENBOT_ON_FLOOR=1` (an arc meets a table edge at any angle).
 - **Goals, reminders, watches, rest** (`common/agenda.py`) -- up to 3 open
   goals in `state/mind/agenda.md`; resolving one saves "question ->
   conclusion" as a lesson. `remind_me` wakes it later (and rests until
@@ -218,6 +249,56 @@ On a Mac: `tools/setup-mac-whisper.sh <robot-ip>` (a launchd agent on :8178;
 the script's header shows how to remove it), then `OPENBOT_MAC_WHISPER_PORT=8178`.
 The robot finds it on the same host as the LLM server. End of speech -> transcript:
 ~1.2s (was ~3.2s on the Pi alone).
+
+## Text it on WhatsApp (optional)
+
+`openbot-chat` (`services/chat.py`) lets you text the bot. It answers as itself: the same
+prompt, journal and memories as when you talk to it, plus what its camera sees right now,
+and it sends you that photo when you ask to see ("show me"). Send it a photo and it looks
+at yours instead. It never moves from a text: nobody may be watching the table edge.
+
+The robot logs in as a **linked device of a spare WhatsApp number**, the way WhatsApp Web
+does ([neonize](https://github.com/krypton-byte/neonize)). It only connects out, so no
+public address or tunnel is needed. But it's unofficial: it breaks WhatsApp's terms, and a
+ban is permanent. **Use a number you can afford to lose, never your own.**
+
+1. Put the spare number's SIM in a phone and set up WhatsApp on it.
+2. In `openbot.env`, set who may text it (country code first; everyone else is ignored):
+   `OPENBOT_CHAT_ALLOW="+91 98765 43210"`. Then `sudo systemd/install.sh`.
+3. `journalctl -u openbot-chat -f -o cat -a` shows a QR code. On the spare phone:
+   WhatsApp > Settings > Linked devices > Link a device, and scan it.
+4. Text the spare number from an allowed phone.
+
+Open WhatsApp on the spare phone at least every 14 days, or WhatsApp logs the robot out
+(the dashboard shows `openbot-chat` stale; step 3 again). The login is kept in
+`~/.openbot-whatsapp/`. It ignores voice notes, videos, stickers and group chats.
+
+**Who's texting** is learned like a face: text "My name is Atul" once (or "this is atul", for
+someone it already knows) and that number is Atul's -- the person it knows by face and in its
+notes, which gain "Atul texts me on WhatsApp". The number itself stays in `~/.openbot-whatsapp/`.
+
+**Commands** -- texted exactly, they work as if said out loud next to it: `/be-quiet` (ends a
+conversation someone is having with it), `/go-to-sleep`, `/wake-up`.
+
+**It texts first**, too:
+- how its day went, at 8 PM (`OPENBOT_CHAT_SUMMARY_AT=20:00`), and last night's dream in the
+  morning (`OPENBOT_CHAT_DREAM_AT=08:00`);
+- whenever something happens or crosses its mind that's worth a text -- but neither the LLM nor
+  a rule decides that: after each thought it asks [Jev](https://docs.typesafe.ai) (TypeSafe's
+  decision model) whether this moment is one you want a text about (`OPENBOT_CHAT_TEXT_WHEN`,
+  default: its mood changes to curious or bored, or something unusually big happens), with its
+  mood before and now, the thought, what just happened and when it last texted. On a yes the
+  LLM writes the text (maybe with a photo). At most one every 10 minutes, however keen Jev is. Needs a TypeSafe API key on the
+  robot -- without one it never texts first (except the summary and the dream):
+
+  ```bash
+  ssh -t user@robot 'read -rsp "Jev API key: " k; echo; printf "OPENBOT_JEV_API_KEY=%s\n" "$k" | sudo tee /etc/openbot/jev.env >/dev/null; sudo chmod 600 /etc/openbot/jev.env; sudo systemctl restart openbot-mind'
+  ```
+
+  The dashboard's **Jev** tab shows every question asked of Jev -- the whole state sent, the
+  options, Jev's whole answer -- newest first. All of them are kept, one file a day, in
+  `state/jev/<day>.jsonl` (never trimmed): state in, Jev's choice and probabilities out --
+  training data for a classifier of your own that does Jev's job.
 
 ## Driving (PiCar-X): designed in a simulator first (`movement/navigate.py`, `sim/`)
 
@@ -266,7 +347,7 @@ end it -- until one of:
 | Say | Does |
 |---|---|
 | **be quiet** / "Rocky, quiet" / stop session | ends the conversation. Rocky stays awake in the background -- watching, thinking, following faces -- and may still speak up on its own. "Rocky" starts a new one. |
-| **go to sleep** | everything off except the voice listener: camera, thinking, face-following, fidgets, sensors and reflexes (cliff safety too), head down. Only the nightly memory review still runs. **Only "Rocky, wake up" wakes it** -- plain "Rocky" is ignored while asleep. |
+| **go to sleep** | everything off except the voice listener: camera, thinking, face-following, sensors and reflexes (cliff safety too), head down. Only the nightly memory review still runs. **Only "Rocky, wake up" wakes it** -- plain "Rocky" is ignored while asleep. Waking alone just brings it back to awake-in-the-background (one sleepy word, no conversation); "Rocky, wake up, what time is it" wakes it and answers. |
 | **louder** / **softer** | speaker volume (15% steps; remembered across reboots) |
 
 Commands also work said over Rocky while it's talking. The mind pauses only
@@ -292,7 +373,7 @@ state/mind/
   journal lines; `memory.recall(query)` searches notes AND journal lines
   (semantic + full-text, ~1s) -- the mind uses it each reflection and as a
   tool, conversations use it with your words as the query.
-- Once a night (after midnight, quiet hours) a "dream" pass distills
+- Once a day (first thing after midnight) a "dream" pass distills
   yesterday's journal into notes by kind.
 - Files are written directly with complete frontmatter (incl. `permalink`)
   -- Basic Memory rewrites files missing one, which would race with appends.
@@ -317,7 +398,7 @@ kept loaded (not reloaded per utterance).
 
 - **`config.py`** -- properties of *this physical robot*: the body, LLM base URL/
   model, STT device/language, safety thresholds
-  (`SAFE_DISTANCE`/`DANGER_DISTANCE`/`CLIFF_REFERENCE`), quiet hours,
+  (`SAFE_DISTANCE`/`DANGER_DISTANCE`/`CLIFF_REFERENCE`),
   dashboard port. Env-var overrides follow `OPENBOT_*`.
 - **`personas/<name>/`** -- everything about a bot's identity: name, wake/
   sleep words, system prompt, wake-greeting lines, Piper voice, an optional
@@ -334,11 +415,12 @@ vocabulary (gestures, `bullfight`/`fist bump` hardware behavior) stays in
 Every `common/` module has a small `assert`-based self-check:
 
 ```bash
-for m in bounded state health motor_client policy cognition mic_stream stt events sensors persona reply_schema speak_client surprise vision memory journal agenda commands faces decider jev; do
+for m in bounded state health motor_client policy cognition mic_stream stt events sensors persona reply_schema speak_client surprise vision memory journal agenda commands faces contacts decider jev; do
   python3 -m common.$m
 done
 python3 -m personas.rocky.transform
 python3 -m personas.rocky.voice   # needs SDL_AUDIODRIVER=dummy off-Pi
+python3 -m services.chat --check  # who WhatsApp messages are answered from (needs neonize)
 ```
 
 With `OPENBOT_BODY=none` every service except `alive` imports anywhere the

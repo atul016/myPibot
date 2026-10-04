@@ -10,7 +10,8 @@ dashboard's Camera tab -- asks this service instead of opening the camera:
 the Pi's camera can only be open in one process at a time.
 
 Same shape as openbot-speak for audio and openbot-alive for motors: one
-owner per piece of hardware, everyone else asks. Pure stdlib.
+owner per piece of hardware, everyone else asks. Also publishes who's in
+frame (common/faces.py) and how much the picture is changing (motion).
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from common import faces, health, state
+from common import faces, health, objects, sensors, state
 
 COMPONENT = "openbot-camera"
 PORT = int(os.environ.get("OPENBOT_CAMERA_PORT", "9000"))
@@ -126,6 +127,63 @@ def _face_loop() -> None:
         time.sleep(FACE_INTERVAL_S)
 
 
+def _object_loop() -> None:
+    """What's in frame, by name, every OBJECT_INTERVAL_S -> state/objects.json
+    (common/objects.py). Optional, like faces: no model, no names."""
+    try:
+        detector = objects.Detector()
+    except Exception as e:
+        print(f"{COMPONENT}: object detection off ({e})")
+        return
+    last = 0.0
+    while True:
+        time.sleep(objects.OBJECT_INTERVAL_S)
+        with _new_frame:
+            frame, ts = _frame, _frame_ts
+        if frame and ts > last:  # asleep or stalled: nothing published, so readers see it as stale
+            last = ts
+            try:
+                objects.publish(detector.detect(frame))
+            except Exception as e:
+                print(f"{COMPONENT}: object detection failed: {e}")
+
+
+MOTION_INTERVAL_S = 0.5
+
+
+def frame_change(prev: bytes | None, jpeg: bytes) -> tuple[float, bytes]:
+    """(mean abs pixel difference 0-255, this frame's tiny grey thumbnail).
+    32x24 grey: cheap, and camera noise averages out."""
+    import io
+    from PIL import Image
+    small = Image.open(io.BytesIO(jpeg)).convert("L").resize((32, 24)).tobytes()
+    if prev is None or len(prev) != len(small):
+        return 0.0, small
+    return sum(abs(a - b) for a, b in zip(prev, small)) / len(small), small
+
+
+def _motion_loop() -> None:
+    """How much the picture is changing, twice a second -> state/motion.json.
+    openbot-mind turns sustained change into a "something is moving" surprise
+    (common/surprise.py) -- eyes that notice movement, not just a look every 90s."""
+    prev, levels, last = None, [], 0.0
+    while True:
+        time.sleep(MOTION_INTERVAL_S)
+        with _new_frame:
+            frame, ts = _frame, _frame_ts
+        if not frame or ts <= last:
+            prev = None  # asleep / camera gap: don't compare across it
+            continue
+        last = ts
+        try:
+            level, prev = frame_change(prev, frame)
+        except Exception as e:  # PIL missing or a bad frame: motion detection is optional
+            print(f"{COMPONENT}: motion detection off ({e})")
+            return
+        levels = (levels + [round(level, 1)])[-10:]
+        sensors.publish_motion(levels)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:  # quiet: the dashboard polls
         pass
@@ -170,6 +228,8 @@ def main() -> None:
     health.start_watchdog(COMPONENT, 60.0, 10.0)
     threading.Thread(target=_capture_loop, daemon=True).start()
     threading.Thread(target=_face_loop, daemon=True).start()
+    threading.Thread(target=_motion_loop, daemon=True).start()
+    threading.Thread(target=_object_loop, daemon=True).start()
     print(f"{COMPONENT}: streaming on :{PORT} (/mjpg, /snapshot.jpg)")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
@@ -179,6 +239,17 @@ def demo() -> None:
     frames, rest = split_frames(b"junk" + a + b + b"\xff\xd8partial")
     assert frames == [a, b] and rest == b"\xff\xd8partial"
     assert split_frames(b"") == ([], b"") and split_frames(b"no jpeg here") == ([], b"")
+    try:
+        import io
+        from PIL import Image
+    except ImportError:
+        return
+    dark, light = io.BytesIO(), io.BytesIO()
+    Image.new("L", (64, 48), 10).save(dark, "JPEG"); Image.new("L", (64, 48), 200).save(light, "JPEG")
+    level0, thumb = frame_change(None, dark.getvalue())
+    level1, _ = frame_change(thumb, light.getvalue())
+    level2, _ = frame_change(thumb, dark.getvalue())
+    assert level0 == 0.0 and level1 > 150 and level2 < 3, (level0, level1, level2)
 
 
 if __name__ == "__main__":

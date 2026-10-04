@@ -13,7 +13,7 @@ python3 -c 'import sys; sys.exit(sys.version_info < (3, 12))' || {
 
 echo "== apt packages"
 sudo apt update
-sudo apt install -y git curl unzip alsa-utils ffmpeg pipx python3-pip espeak sox \
+sudo apt install -y git curl unzip alsa-utils ffmpeg file pipx python3-pip espeak sox \
   python3-requests python3-flask python3-filelock python3-numpy python3-pygame \
   python3-pydantic python3-pil python3-opencv
 
@@ -32,6 +32,9 @@ for m in vosk-model-small-en-us-0.15 vosk-model-small-en-in-0.4; do
   unzip -q /tmp/$m.zip -d ~/.vosk_models && rm /tmp/$m.zip
 done
 
+echo "== WhatsApp chat (optional, README: \"Text it on WhatsApp\"): neonize"
+"${PIP[@]}" neonize
+
 [ -f "$DIR/openbot.env" ] || { cp "$DIR/openbot.env.example" "$DIR/openbot.env"; echo "   created openbot.env -- edit it"; }
 [ $PICARX = 1 ] && sed -i -e 's/^OPENBOT_BODY=.*/OPENBOT_BODY=picarx/' \
   -e 's/^OPENBOT_MIXER=.*/OPENBOT_MIXER="2:robot-hat speaker"/' "$DIR/openbot.env"
@@ -44,11 +47,18 @@ mkdir -p "$DIR/state/mind"
 ~/.local/bin/basic-memory project add "$PROJECT" "$DIR/state/mind" || true  # already added -> fine
 ~/.local/bin/basic-memory project default "$PROJECT"
 
-echo "== face detection + recognition models (OpenCV model zoo)"
+echo "== face detection + recognition and object detection models (OpenCV model zoo)"
 mkdir -p ~/.openbot-models
-for f in face_detection_yunet/face_detection_yunet_2023mar.onnx face_recognition_sface/face_recognition_sface_2021dec.onnx; do
+for f in face_detection_yunet/face_detection_yunet_2023mar.onnx face_recognition_sface/face_recognition_sface_2021dec.onnx \
+         object_detection_nanodet/object_detection_nanodet_2022nov.onnx; do
   [ -s ~/.openbot-models/$(basename $f) ] || curl -fsSL -o ~/.openbot-models/$(basename $f) "https://github.com/opencv/opencv_zoo/raw/main/models/$f"
 done
+echo "== what a sound was (YAMNet, Google) and who's talking (WeSpeaker voice prints)"
+"${PIP[@]}" ai-edge-litert
+get() { [ -s ~/.openbot-models/$1 ] || curl -fsSL -o ~/.openbot-models/$1 "$2"; }
+get yamnet.tflite https://storage.googleapis.com/mediapipe-models/audio_classifier/yamnet/float32/1/yamnet.tflite
+get yamnet_class_map.csv https://raw.githubusercontent.com/tensorflow/models/master/research/audioset/yamnet/yamnet_class_map.csv
+get voxceleb_resnet34_LM.onnx https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM/resolve/main/voxceleb_resnet34_LM.onnx
 
 if [ $PICARX = 1 ]; then
   echo "== PiCar-X: robot-hat 2.5.x, vilib, picar-x 2.1.x"
@@ -71,7 +81,15 @@ fi
 sudo mkdir -p /var/log/journal /etc/systemd/journald.conf.d
 printf '[Journal]\nStorage=persistent\n' | sudo tee /etc/systemd/journald.conf.d/90-openbot.conf >/dev/null
 sudo systemctl restart systemd-journald
-python3 -c "import vosk, piper, faster_whisper, cv2, flask; print('imports ok')"
+
+# USB mic capture gain to max and persisted: a fresh install leaves it at ~69%, which
+# halves speech level (peak -24 dBFS vs -14 at max, noise floor barely moves) and
+# follow-ups went unheard. No-op if no USB mic is plugged in yet.
+for card in $(arecord -l 2>/dev/null | sed -n 's/^card \([0-9]*\):.*USB.*/\1/p'); do
+  amixer -q -c "$card" sset Mic 100% 2>/dev/null && echo "mic gain: card $card -> 100%"
+done
+sudo alsactl store
+python3 -c "import vosk, piper, faster_whisper, cv2, flask, neonize; print('imports ok')"
 echo
 echo "Done. Next:"
 echo "  1. Edit $DIR/openbot.env (the LLM server, your mic name from 'arecord -l')"

@@ -13,7 +13,7 @@ import importlib
 from dataclasses import dataclass
 from typing import Callable
 
-_PROVIDERS = {"jev": "common.jev"}  # name -> module exposing make()
+_PROVIDERS = {"jev": "common.jev", "local": "common.local_decider"}  # name -> module exposing make()
 
 
 @dataclass(frozen=True)

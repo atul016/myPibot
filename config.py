@@ -14,16 +14,17 @@ Another robot: write a service that answers the openbot-alive socket
 """
 from __future__ import annotations
 
+import datetime
 import os
 
 BODY = os.environ.get("OPENBOT_BODY", "none")
 if BODY == "picarx":
     import movement.actions  # noqa: F401 -- patches actions_dict; must run before it's read below
     import movement.sounds  # noqa: F401
-    from movement.actions import LOOK_ANGLES
+    from movement.actions import GESTURE_GUIDE, LOOK_ANGLES
     from picarx.preset_actions import actions_dict
 elif BODY == "none":
-    LOOK_ANGLES, actions_dict = {"ahead": (0, 0)}, {}
+    LOOK_ANGLES, actions_dict, GESTURE_GUIDE = {"ahead": (0, 0)}, {}, {}
 else:
     raise SystemExit(f"OPENBOT_BODY={BODY!r}: expected 'none' or 'picarx'")
 HAS_BODY = BODY != "none"
@@ -66,7 +67,7 @@ CLIFF_REFERENCE = [200, 200, 200]
 
 SAFETY_ACTIONS = {"safety backward"}
 MOVEMENT_ACTIONS = {"forward", "backward", "act cute", "twist body", "turn left", "turn right",
-                     "fist bump", "bullfight"} & set(actions_dict)  # empty with no body
+                     "fist bump", "bullfight", "dance"} & set(actions_dict)  # empty with no body
 LOOK_ACTIONS = {name for name in actions_dict if name.startswith("look ")}  # mind's `look` tool, see movement/actions.py
 STATIONARY_ACTIONS = sorted(set(actions_dict) - MOVEMENT_ACTIONS - SAFETY_ACTIONS - LOOK_ACTIONS)
 # What the persona's prompt advertises the LLM "can perform" -- deliberately
@@ -76,15 +77,22 @@ STATIONARY_ACTIONS = sorted(set(actions_dict) - MOVEMENT_ACTIONS - SAFETY_ACTION
 # actually be performed.
 ALLOWED_ACTIONS = sorted(set(STATIONARY_ACTIONS) | MOVEMENT_ACTIONS)
 
-SAFETY_TRIGGERS_SPEAK = False  # physical safety action fires either way; this only gates the extra LLM round
-CLIFF_TRIGGERS_MOVE = True
-DANGER_TRIGGERS_MOVE = True
-CAUTION_TRIGGERS_MOVE = True
-# Playful proximity reactions (fist bump / bullfight + a line): at most one a
-# minute -- at 10s, leaning in to talk got "Whoa there!" every few seconds.
-REACTION_COOLDOWN_SEC = 60.0
-BULLFIGHT_SEQUENCE = ["rub hands", "bullfight"]
-FIST_BUMP_SEQUENCE = ["wave hands", "fist bump"]
+CLIFF_TRIGGERS_MOVE = True  # the one reflex: back away from an edge
+# Wheel moves the MIND may choose as gestures: short, bounded, cliff-checked nudges
+# (movement/actions.py). Everything else on the wheels is a spoken command.
+# "dance" (a circle and a figure 8) joins them only when the robot lives on the floor: an arc
+# meets a table edge at any angle, which the floor sensor can't always catch in time.
+ON_FLOOR = os.environ.get("OPENBOT_ON_FLOOR", "0") == "1"
+PLAYFUL_ACTIONS = sorted(({"fist bump", "bullfight"} | ({"dance"} if ON_FLOOR else set())) & MOVEMENT_ACTIONS)
+# What a reply's tone_action may be: a stationary gesture, or -- when something is right
+# in front of it -- one of the playful nudges. The LLM decides; the prompt says when.
+TONE_ACTIONS = sorted(set(STATIONARY_ACTIONS) | set(PLAYFUL_ACTIONS))
+
+
+def describe_actions(names: list[str]) -> str:
+    """"nod (agreement, something good); think (...)" -- for prompts, from the body's
+    own GESTURE_GUIDE; a name the body didn't describe is listed bare."""
+    return "; ".join(f"{n} ({GESTURE_GUIDE[n]})" if GESTURE_GUIDE.get(n) else n for n in names)
 
 # --- Sessions -------------------------------------------------------------
 # A session lasts until "stop session" / "go to sleep" (common/commands.py).
@@ -94,13 +102,12 @@ FIST_BUMP_SEQUENCE = ["wave hands", "fist bump"]
 BARGE_IN_ENABLED = os.environ.get("OPENBOT_BARGE_IN", "1") != "0"
 
 # --- Autonomous "mind" loop -----------------------------------------------
-QUIET_HOURS_START = int(os.environ.get("OPENBOT_QUIET_START_H", "21"))
-QUIET_HOURS_END = int(os.environ.get("OPENBOT_QUIET_END_H", "8"))
 # How often openbot-mind samples sensors/hearing for surprises (common/
 # surprise.py). A surprise triggers a reflection right away, rate-limited
 # by SURPRISE_MIN_GAP_S; with nothing happening it still reflects every
 # REFLECTION_IDLE_INTERVAL_S ("bored" -- a chance to wonder about something).
-AWARENESS_INTERVAL_S = float(os.environ.get("OPENBOT_AWARENESS_INTERVAL_S", "2"))
+# 0.5s (was 2): a hand held out should get its bump within a moment, not a couple of seconds.
+AWARENESS_INTERVAL_S = float(os.environ.get("OPENBOT_AWARENESS_INTERVAL_S", "0.5"))
 # 60s, was 30: every desk tap and head turn became its own reflection.
 SURPRISE_MIN_GAP_S = float(os.environ.get("OPENBOT_SURPRISE_MIN_GAP_S", "60"))
 # After a loud-sound surprise, more of them are ignored this long unless at least
@@ -124,13 +131,33 @@ MIND_MAX_STEPS = int(os.environ.get("OPENBOT_MIND_MAX_STEPS", "4"))
 EXPRESSION_COOLDOWN_S = float(os.environ.get("OPENBOT_EXPRESSION_COOLDOWN_S", "120"))
 # Rolling "today so far" summary (state/mind/summaries/), rewritten when the
 # journal has grown by at least SUMMARY_MIN_NEW_LINES. The durable "dream"
-# consolidation into notes by kind runs once a night, in quiet hours.
+# consolidation into notes by kind runs once a day, first thing after midnight.
 SUMMARY_INTERVAL_S = float(os.environ.get("OPENBOT_SUMMARY_INTERVAL_S", "1800"))
 SUMMARY_MIN_NEW_LINES = int(os.environ.get("OPENBOT_SUMMARY_MIN_NEW_LINES", "5"))
 
 # --- Dashboard --------------------------------------------------------------
 DASHBOARD_ENABLED = os.environ.get("OPENBOT_DASHBOARD_ENABLED", "1") != "0"
 DASHBOARD_PORT = int(os.environ.get("OPENBOT_DASHBOARD_PORT", "8080"))
+
+# --- WhatsApp chat (services/chat.py) ----------------------------------------
+# Who may text the robot: phone numbers with country code, comma-separated
+# ("+91 98765 43210, +1 415 555 0100"). Empty -> no openbot-chat. Everyone else
+# is ignored -- whoever can text it can see through its camera.
+CHAT_ALLOW = {"".join(filter(str.isdigit, n)) for n in os.environ.get("OPENBOT_CHAT_ALLOW", "").split(",")} - {""}
+# When it texts first, 24h clock: how its day went, and last night's dream.
+CHAT_SUMMARY_AT = datetime.datetime.strptime(os.environ.get("OPENBOT_CHAT_SUMMARY_AT", "20:00"), "%H:%M").strftime("%H:%M")
+CHAT_DREAM_AT = datetime.datetime.strptime(os.environ.get("OPENBOT_CHAT_DREAM_AT", "08:00"), "%H:%M").strftime("%H:%M")
+# Whether a moment is worth a text, after each reflection: this engine decides (common/decider.py --
+# jev needs OPENBOT_JEV_API_KEY, in /etc/openbot/jev.env). "" or no key: it never texts first,
+# except the summary and the dream.
+TEXT_DECIDER = os.environ.get("OPENBOT_TEXT_DECIDER", "jev")
+# What its person wants a text about: part of the question the engine weighs each moment against.
+# Precise on purpose: "his mood turns curious or bored" made Jev pick 46 of 52 moments (a bored
+# robot stays bored); this picked 3 -- exactly the mood changes and the stranger arriving.
+CHAT_TEXT_WHEN = os.environ.get("OPENBOT_CHAT_TEXT_WHEN",
+                                "his mood changes to curious or bored (his mood before and now differ -- not while "
+                                "it stays the same), or something unusually big happens near him (someone arriving, "
+                                "something new appearing -- not the usual small motion or noise)")
 
 # --- Face tracking ----------------------------------------------------------
 # Off by default -- vision/tracking.py has a documented live deadlock in

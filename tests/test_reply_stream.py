@@ -22,7 +22,7 @@ t0 = 0.0
 gestures: list[float] = []
 wl.motor_dispatch = lambda actions, wait=False: gestures.append(time.time() - t0) or True
 persona = persona_mod.load()
-Reply = reply_schema.build_reply_model(cfg.STATIONARY_ACTIONS)
+Reply = reply_schema.build_reply_model(cfg.TONE_ACTIONS)
 
 for question in ["What am I holding in my hand?", "Tell me a short story about a robot and a cat."]:
     out, history, times = {}, [], []

@@ -21,6 +21,7 @@ same time.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import queue
@@ -35,7 +36,8 @@ import common.system  # noqa: F401 -- side effect, harmless even though this pro
 
 import config as cfg  # noqa: E402
 from common import cognition, events as dash_events, health, mic_stream, persona as persona_mod  # noqa: E402
-from common import commands, faces, journal, memory, reply_schema, sensors, speak_client as speak_mod, state, vision  # noqa: E402
+from common import commands, faces, journal, memory, react, reply_schema, sensors, speak_client as speak_mod, state, vision  # noqa: E402
+from common import sounds, surprise, voices  # noqa: E402
 from common.motor_client import dispatch as motor_dispatch  # noqa: E402
 from common.speak_client import speak as speak_client  # noqa: E402
 from common import stt  # noqa: E402
@@ -53,6 +55,11 @@ MAX_RECORD_S = 20.0
 # this long for more before replying -- a short thinking pause mid-sentence
 # shouldn't end your turn, but Rocky shouldn't sit through 3s of silence either.
 PAUSE_S = 0.8
+# ...plus this once, when Whisper's transcript so far stops mid-sentence (no final
+# . ? ! or a trailing "..."/"--"): "Also her name is not", "This is going to be a--"
+# and "I can suggest how we..." were all answered mid-sentence (2026-10-02), and no
+# finished sentence that day lacked the punctuation.
+UNFINISHED_EXTRA_S = 0.8
 # Audio kept from BEFORE speech was confirmed. Confirmation needs Vosk to hear two
 # words (~1s in), so 0.5s of pre-roll clipped the start ("There is a delay
 # between..." came out "Between..."). ~2s; leading silence costs Whisper nothing.
@@ -73,9 +80,12 @@ INTERRUPT_PHRASES = ["stop", "wait", "hold on", "be quiet", "stop session", "go 
 def _wake_up_phrases(name: str) -> list[str]:
     return [f"{name} wake up", f"wake up {name}", f"hey {name} wake up"]
 
-_offered_fist_bump = False
+_offered_move: str | None = None  # a wheel move the last reply offered ("want a fist bump?") -- "yes" does it
 _whisper: "stt.Whisper | stt.RemoteWhisper | None" = None  # set in the background at startup; None until then
 _wake_model = None  # set in main(); also used for the barge-in recognizer
+_sounds: "sounds.Classifier | None" = None  # loaded in the background at startup; optional (no model, no names)
+_voices: "voices.VoiceEngine | None" = None
+_voice_speaker: str | None = None  # this turn's speaker, known only by voice (no face said who)
 
 
 def _vosk_model_path() -> str:
@@ -102,7 +112,7 @@ def _started(heard: str) -> bool:
 
 
 def _listen(mic: mic_stream.ArecordStream, onset_timeout_s: float, seed: bytes = b"",
-            speculate=None, spec_out: dict | None = None) -> tuple[bytes, str]:
+            speculate=None, spec_out: dict | None = None, stop=None) -> tuple[bytes, str]:
     """Waits (patiently, up to onset_timeout_s) for someone to start talking,
     then records until they stop -- both decided by a STREAMING Vosk
     recognizer (are there words?), not by loudness: a fixed loudness
@@ -110,14 +120,17 @@ def _listen(mic: mic_stream.ArecordStream, onset_timeout_s: float, seed: bytes =
     (audio, transcript) -- the transcript is Whisper's, Vosk's as fallback.
     `seed`: audio already heard (the wake word) to put in front, if speech follows.
     `speculate(audio, heard_from)` -> _Speculation, started at each pause; the
-    one still valid when you stop is returned in spec_out["spec"]."""
+    one still valid when you stop is returned in spec_out["spec"]. `stop()`:
+    asked about once a second while nobody is talking yet -- True ends the wait."""
     rec = vosk.KaldiRecognizer(_wake_model, VOSK_RATE)
     preroll: deque[bytes] = deque(maxlen=PREROLL_CHUNKS)
     captured: list[bytes] = []
     results: list[dict] = []
     started_at = pause_until = None
+    extended = False  # the unfinished-sentence extra wait, at most once per pause
     spec = None
     deadline = time.time() + onset_timeout_s
+    next_stop_check = 0.0
     chunk_frames = mic.chunk_bytes // 2
     while True:
         # A patient wait inside a multi-turn session is normal, not a hang --
@@ -134,7 +147,7 @@ def _listen(mic: mic_stream.ArecordStream, onset_timeout_s: float, seed: bytes =
                 if not started_at:
                     started_at, captured = now, ([seed] if seed else []) + list(preroll)
                 results.append(res)
-                pause_until = now + PAUSE_S
+                pause_until, extended = now + PAUSE_S, False
                 if speculate is not None and _whisper is not None:
                     if spec is not None:
                         spec.cancel()
@@ -153,7 +166,13 @@ def _listen(mic: mic_stream.ArecordStream, onset_timeout_s: float, seed: bytes =
         if not started_at:
             if now > deadline:
                 return b"", ""
+            if stop is not None and now >= next_stop_check:
+                next_stop_check = now + 1.0
+                if stop():
+                    return b"", ""
             continue
+        if pause_until and now >= pause_until and not extended and spec is not None and spec.unfinished():
+            pause_until, extended = now + UNFINISHED_EXTRA_S, True  # probably looking for the next word
         if (pause_until and now >= pause_until) or now - started_at > MAX_RECORD_S:
             break
     if not pause_until:  # cut off by MAX_RECORD_S mid-phrase
@@ -165,9 +184,13 @@ def _listen(mic: mic_stream.ArecordStream, onset_timeout_s: float, seed: bytes =
     if spec is not None and pause_until and spec_out is not None:
         text = spec.transcript()
         if text:
-            print(f"stt: used the transcript made during the pause: {text!r}")
+            print(f"stt: used the transcript made during the pause: vosk "
+                  f"{' '.join(r.get('text', '') for r in results)!r} -> {text!r} ({len(audio) / 2 / mic.rate:.1f}s audio)")
             spec_out["spec"] = spec
             return audio, text
+        if spec.whisper_answered:  # Whisper already judged it noise (or all Rocky's own words) --
+            spec.cancel()          # a second run on the same audio re-rolled "You can see the next one."
+            return audio, ""
     if spec is not None:
         spec.cancel()
     text = stt.vosk_text(results)
@@ -179,7 +202,7 @@ def _listen(mic: mic_stream.ArecordStream, onset_timeout_s: float, seed: bytes =
         t0 = time.monotonic()
         better = _whisper.transcribe(audio)
         print(f"stt: vosk {text!r} -> whisper {better!r} in {time.monotonic() - t0:.1f}s")
-        text = better or text
+        text = better if better is not None else text  # "": Whisper's verdict was noise -- not Vosk's guess
     # Rocky may have been talking while the mic was open (a reflex, the mind, its
     # own reply's tail): drop its exact sentences, keep what the person said.
     said = speak_mod.said_between(heard_from, time.time())
@@ -193,23 +216,56 @@ def _listen(mic: mic_stream.ArecordStream, onset_timeout_s: float, seed: bytes =
     return audio, text
 
 
+def _planned_move(text: str) -> str | None:
+    """The body move this transcript triggers -- keywords decide, never the LLM."""
+    move = detect_movement_keyword(text)
+    if not move and _offered_move and is_affirmative(text):
+        move = _offered_move
+    return move if move in cfg.ALLOWED_ACTIONS else None
+
+
 def _reply_sentences(persona, Reply, user_text: str, history: list[dict], out: dict,
-                     on_tone=lambda tone: motor_dispatch([tone])) -> Iterator[str]:
+                     on_tone=lambda tone: motor_dispatch([tone]), moved: str | None = None) -> Iterator[str]:
     """Streams the reply, yielding each finished sentence (persona-transformed)
     the moment it's complete -- speech starts while the rest is still being
     generated. on_tone(gesture) is called as soon as the gesture is named (it
     streams first). Never ends in silence: an unreachable LLM yields one plain
     "can't reach my brain" line. Side-effect free otherwise (a speculative
     reply may be thrown away): fills out["text"] / out["raw"]; `history` is
-    only read -- the caller commits the exchange (_commit_history)."""
-    prompt = persona.system_prompt_template(cfg.ALLOWED_ACTIONS, cfg.STATIONARY_ACTIONS)
-    # A fresh camera frame with EVERY turn, not the mind's last look (up to 90s
+    only read -- the caller commits the exchange (_commit_history). `moved`:
+    the body move this turn triggered (it's told, so it never claims one that
+    didn't happen -- "moving forward" got said with the wheels still)."""
+    prompt = persona.system_prompt_template(cfg.ALLOWED_ACTIONS, cfg.STATIONARY_ACTIONS,
+                                            cfg.describe_actions(cfg.STATIONARY_ACTIONS))
+    called_only = not [w for w in stt._words(user_text) if w not in (_wake_name(persona), "hey", "hi", "ok", "okay")]
+    # A fresh camera frame with every turn, not the mind's last look (up to 90s
     # old): "what am I holding?" got guesses ("a pen? a stylus?") without it.
-    # Measured: +0.1-0.2s to the first word; frame grab ~0.04s.
-    photo = vision.capture()
+    # Measured: +0.1-0.2s to the first word; frame grab ~0.04s. Not for a bare
+    # "Rocky?": with a photo and nothing asked, it described the room every time.
+    photo = None if called_only else vision.capture()
+    if called_only:
+        turn = ("They only said your name -- they want your attention. Answer in a few words, "
+                "like \"Yes? What's up?\" -- don't describe anything.\n")
+    else:
+        turn = ("Talk naturally, like a friend in a conversation. Don't describe your surroundings "
+                "unless they ask what you see, what they're showing or holding, or who they are.\n")
+        if photo:
+            turn += "The attached photo is what your camera sees right now -- use it for those questions.\n"
+    who, by = faces.speaker(faces.read()), "face"
+    if not who and _voice_speaker:
+        who, by = _voice_speaker, "voice"
+    if who:
+        turn += f"The person talking to you is {who} (you recognize their {by}). Use their name when it fits.\n"
+    if cfg.CAN_DRIVE:
+        turn += (f"Because of what they just said, your body is doing \"{moved}\" right now -- you may say so.\n"
+                 if moved else "Nothing they just said made you move -- don't say you're moving or about to.\n")
+    near = sensors.read()
+    if cfg.PLAYFUL_ACTIONS and near.get("distance") is not None and near["distance"] <= cfg.SAFE_DISTANCE:
+        turn += (f"Right now something is almost touching your front ({near['distance']:.0f}cm) -- probably their "
+                 f"hand or fist. If it fits the moment, your tone_action may also be: "
+                 f"{cfg.describe_actions(cfg.PLAYFUL_ACTIONS)}.\n")
     conversation_prompt = journal.inject(
-        ("The attached photo is what your camera sees right now -- use it when they ask "
-         "about something they're showing you or what you see.\n" if photo else "") +
+        turn +
         "You can't switch your own modes by agreeing to -- only these exact spoken commands do: "
         f"\"be quiet\" (ends this conversation), \"go to sleep\" (everything off until \"{persona.name}, wake up\"). "
         "If they seem to want one of those, tell them the words to say instead of promising it. " +
@@ -226,7 +282,7 @@ def _reply_sentences(persona, Reply, user_text: str, history: list[dict], out: d
         ready = rs.feed(delta)  # parse first: tone_action may arrive in this same chunk as a sentence
         if not gestured and rs.tone_action is not None:
             gestured = True
-            if rs.tone_action in cfg.STATIONARY_ACTIONS:
+            if rs.tone_action in cfg.TONE_ACTIONS:
                 on_tone(rs.tone_action)
         for sentence in ready:
             yield persona.transform(sentence)
@@ -254,6 +310,7 @@ class _Speculation:
 
     def __init__(self, persona, Reply, audio: bytes, heard_from: float, history: list[dict]):
         self.text = ""
+        self.whisper_answered = False  # True: an empty text is Whisper's verdict, not "couldn't ask"
         self.out: dict = {}
         self._cancelled = threading.Event()
         self._transcribed = threading.Event()
@@ -266,16 +323,19 @@ class _Speculation:
 
     def _run(self, persona, Reply, audio: bytes, heard_from: float, history: list[dict]) -> None:
         try:
-            text = _whisper.transcribe(audio) if _whisper is not None else ""
+            heard = _whisper.transcribe(audio) if _whisper is not None else None
+            text = heard or ""
             said = speak_mod.said_between(heard_from, time.time())
             self.text = stt.remove_echo(text, said) if said and text else text
+            self.whisper_answered = heard is not None
         finally:
             self._transcribed.set()
         reply = None
         try:
             if not self.text or self._cancelled.is_set() or commands.parse(self.text):
                 return  # nothing to answer, or a command -- the turn handles those itself
-            reply = _reply_sentences(persona, Reply, self.text, history, self.out, on_tone=self._on_tone)
+            reply = _reply_sentences(persona, Reply, self.text, history, self.out, on_tone=self._on_tone,
+                                     moved=_planned_move(self.text))
             for sentence in reply:
                 if self._cancelled.is_set():
                     break
@@ -298,6 +358,11 @@ class _Speculation:
     def transcript(self, timeout_s: float = 6.0) -> str:
         self._transcribed.wait(timeout_s)
         return self.text
+
+    def unfinished(self) -> bool:
+        """Whisper's text, if already in, stops mid-sentence."""
+        t = self.text.rstrip() if self._transcribed.is_set() else ""
+        return bool(t) and (t.endswith(("...", "-")) or t[-1] not in ".?!")
 
     def cancel(self) -> None:
         self._cancelled.set()
@@ -385,8 +450,12 @@ def _speak_interruptible(persona, sentences: Iterable[str], mic: mic_stream.Arec
     return " ".join(spoken), None
 
 
-def _say_plain(persona, text: str, mic: mic_stream.ArecordStream) -> None:
-    spoken = persona.transform(text)
+def _say_line(persona, situation: str, fallback: str, mic: mic_stream.ArecordStream) -> None:
+    """Says what the LLM wants to say about `situation` (in its current mood),
+    with the gesture it picks; `fallback` only if the LLM is unreachable."""
+    spoken, tone = react.line(persona, situation, fallback)
+    if tone:
+        motor_dispatch([tone])
     journal.log("said", spoken)
     dash_events.log_event("reply", f"llm response: {spoken}")
     _speak_interruptible(persona, [spoken], mic)
@@ -398,19 +467,58 @@ def _do_navigation(persona, nav: tuple[str, str | None], mic: mic_stream.Arecord
     from common.motor_client import cancel_navigation, navigate
     kind, target = nav
     if not cfg.CAN_DRIVE:
-        _say_plain(persona, "I can't move -- I don't have wheels.", mic)
+        _say_line(persona, "They asked you to drive somewhere, but you have no wheels -- you can't move at all.",
+                  "I can't move -- I don't have wheels.", mic)
         return True
     if kind == "stop":
-        _say_plain(persona, "Stopping." if cancel_navigation() else "Okay.", mic)
+        _say_line(persona, "They said stop -- you've just stopped driving." if cancel_navigation()
+                  else "They said stop, but you weren't moving anyway.", "Okay.", mic)
         return True
     ok, err = navigate({"approach": target} if kind == "approach" else {"explore": 60})
     if not ok:
-        _say_plain(persona, "I'm already on my way -- say stop first." if "already" in err
-                   else "My wheels aren't answering right now.", mic)
+        _say_line(persona, "They asked you to drive somewhere, but you're already on your way somewhere -- "
+                  "they'd have to say stop first." if "already" in err
+                  else "They asked you to drive somewhere, but your wheels aren't answering right now.",
+                  "I can't drive right now.", mic)
         return True
     journal.log("did", f"started driving {'to the ' + target if target else 'around to explore'}")
-    _say_plain(persona, "Coming!" if target == "person" else f"Okay, heading to the {target}." if target
-               else "Okay, exploring!", mic)
+    _say_line(persona, "They said come here, and you've just set off toward them." if target == "person"
+              else f"They asked you to go to the {target}, and you've just set off toward it." if target
+              else "They told you to go explore, and you've just set off.", "Okay!", mic)
+    return True
+
+
+def _wake_up(persona, mic: mic_stream.ArecordStream) -> None:
+    """"Rocky, wake up" with nothing after it: awake in the background -- camera,
+    mind and reflexes resume on the cleared flag -- and one sleepy word, no session."""
+    state.update_session({"asleep": False})
+    motor_dispatch(["look ahead"], wait=True)  # head back up
+    journal.log("woke", "someone woke me up")
+    dash_events.log_event("wake", "woke up")
+    _say_line(persona, "You were asleep and they just said \"wake up\". You're awake now, back to your usual self "
+              "in the background -- one short, sleepy word. (Saying your name starts a conversation.)",
+              "Mm. I'm up.", mic)
+
+
+REMOTE_FRESH_S = 60.0  # a texted command older than this (wake-listen was down) is dropped, not done late
+
+
+def _do_remote(persona, mic: mic_stream.ArecordStream, in_session: bool) -> bool:
+    """A mode command texted on WhatsApp (commands.SLASH, via services/chat.py),
+    carried out as if it had just been said. Returns whether the conversation
+    (if any) goes on."""
+    s = state.load_session()
+    cmd = s.get("remote_command")
+    if not cmd:
+        return True
+    state.update_session({"remote_command": None})
+    if time.time() - s.get("remote_command_ts", 0) > REMOTE_FRESH_S:
+        return True
+    dash_events.log_event("wake", f"texted command: {cmd}")
+    if cmd == commands.WAKE and s.get("asleep"):
+        _wake_up(persona, mic)
+    elif (cmd == commands.SLEEP and not s.get("asleep")) or (cmd == commands.STOP_SESSION and in_session):
+        return _do_command(persona, cmd, mic)
     return True
 
 
@@ -421,10 +529,13 @@ def _do_command(persona, cmd: str, mic: mic_stream.ArecordStream) -> bool:
         cancel_navigation()  # never keep driving after "be quiet" / "go to sleep"
     if cmd == commands.STOP_SESSION:  # "be quiet" / "stop session"
         journal.log("did", "ended the conversation (asked to be quiet) -- still around in the background")
-        _say_plain(persona, "Okay. Say my name if you need me.", mic)
+        _say_line(persona, f"They asked you to be quiet: this conversation is over, but you'll still be around, and "
+                  f"saying \"{persona.name}\" starts a new one. Acknowledge that briefly.",
+                  "Okay. Say my name if you need me.", mic)
         return False
     if cmd == commands.SLEEP:
-        _say_plain(persona, persona.sleep_ack, mic)
+        _say_line(persona, f"They told you to go to sleep -- everything switches off until they say "
+                  f"\"{persona.name}, wake up\". Say a short, sleepy goodnight.", persona.sleep_ack, mic)
         state.update_session({"asleep": True})
         motor_dispatch(["look down"], wait=True)  # head down: visibly asleep
         journal.log("did", f"went to sleep -- everything off, listening only for \"{persona.name}, wake up\"")
@@ -435,25 +546,57 @@ def _do_command(persona, cmd: str, mic: mic_stream.ArecordStream) -> bool:
         current = get_volume() or 100
         target = current + (15 if cmd == commands.LOUDER else -15)
         if cmd == commands.LOUDER and current >= 100:
-            _say_plain(persona, "I'm already as loud as I go!", mic)
+            _say_line(persona, "They asked you to speak louder, but you're already at full volume.",
+                      "I'm already as loud as I go!", mic)
             return True
         new = set_volume(target)
         state.update_session({"volume": new})  # openbot-speak re-applies it after a reboot
         journal.log("did", f"volume {current}% -> {new}%")
-        _say_plain(persona, "Louder now!" if cmd == commands.LOUDER else "Softer now.", mic)
+        _say_line(persona, f"They asked you to speak {'louder' if cmd == commands.LOUDER else 'softer'}, and you "
+                  f"just turned your volume {'up' if cmd == commands.LOUDER else 'down'} to {new}%. Acknowledge it.",
+                  "Louder now!" if cmd == commands.LOUDER else "Softer now.", mic)
         return True
     return True
 
 
+def _learn_voice(who: str, pcm16k: bytes) -> None:
+    """The face says who's talking: what they said adds to their voice samples."""
+    emb = _voices.embed(pcm16k)
+    if emb is not None and voices.enroll(who, emb) == 1:
+        memory.remember("person", who, "voice", f"I can recognize {who}'s voice -- I heard them while I saw them")
+        journal.log("learned", f"what {who} sounds like")
+
+
+def _whose_voice(pcm16k: bytes) -> str | None:
+    emb = _voices.embed(pcm16k)
+    if emb is None:
+        return None
+    name, score = voices.identify(emb)
+    print(f"voices: best match {name or '-'} ({score:.2f})")
+    return name
+
+
 def _run_turn(persona, Reply, user_text: str, history: list[dict],
-              mic: mic_stream.ArecordStream, spec: "_Speculation | None" = None) -> tuple[bool, bool]:
+              mic: mic_stream.ArecordStream, spec: "_Speculation | None" = None,
+              audio: bytes = b"") -> tuple[bool, bool]:
     """One exchange. Returns (continue_session, interrupted) -- continue is
     False after "stop session" or "go to sleep"; interrupted is True if the
-    person talked over the reply."""
-    global _offered_fist_bump
+    person talked over the reply. `audio`: what they said, for voices."""
+    global _offered_move, _voice_speaker
     state.update_session({"last_heard": user_text, "last_heard_ts": time.time(), "last_activity_ts": time.time()})
     dash_events.log_event("wake", f"user: {user_text}")
-    journal.log("heard", user_text)
+    who = faces.speaker(faces.read())
+    _voice_speaker = None
+    if audio and _voices is not None:
+        pcm16k = resample_pcm(audio, MIC_RATE, VOSK_RATE)
+        if who:  # learned in the background: no reply waits for it
+            threading.Thread(target=_learn_voice, args=(who, pcm16k), daemon=True).start()
+        else:
+            who = _voice_speaker = _whose_voice(pcm16k)
+            if who and spec is not None:  # the reply written ahead didn't know who was talking
+                spec.cancel()
+                spec = None
+    journal.log("heard", f"{who}: {user_text}" if who else user_text)
 
     _learn_face(user_text)
 
@@ -471,11 +614,17 @@ def _run_turn(persona, Reply, user_text: str, history: list[dict],
         dash_events.log_event("wake", f'"{user_text}" -> drive {nav}')
         return _do_navigation(persona, nav, mic), False
 
-    move_action = detect_movement_keyword(user_text)
-    if not move_action and _offered_fist_bump and is_affirmative(user_text):
-        move_action = "fist bump"
-    if move_action in cfg.ALLOWED_ACTIONS:
-        motor_dispatch([move_action], wait=True)  # speech never starts mid-drive
+    move_action = _planned_move(user_text)
+    if move_action:
+        # Queued, not awaited: the words come WITH the move ("watch me dance" while dancing), not
+        # after it. dispatch() still reports whether the body accepted it (down, or mid-drive).
+        if motor_dispatch([move_action]):
+            journal.log("did", f"moved: {move_action}")
+            dash_events.log_event("wake", f'"{user_text}" -> move {move_action}')
+        else:  # alive down or mid-drive: a reply written ahead must not claim the move
+            move_action = None
+            if spec is not None:
+                spec.cancel()
 
     out: dict = {}
     if spec is not None and spec.ready_for(user_text):
@@ -483,10 +632,11 @@ def _run_turn(persona, Reply, user_text: str, history: list[dict],
     else:
         if spec is not None:
             spec.cancel()
-        sentences = _reply_sentences(persona, Reply, user_text, history, out)
+        sentences = _reply_sentences(persona, Reply, user_text, history, out, moved=move_action)
     spoken, cut_by = _speak_interruptible(persona, sentences, mic)
     _commit_history(history, user_text, out)
-    _offered_fist_bump = "fist bump" in out.get("text", "").lower()
+    said = out.get("text", "").lower()
+    _offered_move = next((a for a in cfg.PLAYFUL_ACTIONS if a in said), None)
     dash_events.log_event("reply", f"llm response: {spoken}")
     journal.log("said", spoken)
     state.update_session({"last_activity_ts": time.time()})
@@ -499,69 +649,98 @@ def _run_turn(persona, Reply, user_text: str, history: list[dict],
 
 
 def _learn_face(user_text: str) -> None:
-    """"My name is Atul" with a face in view -> remember that face as Atul's.
+    """"My name is Atul" with ONE face in view -> remember that face as Atul's.
     Also tops up the samples of someone recognized only weakly (new light,
-    new angle), so recognition improves the more you talk to Rocky."""
+    new angle), so recognition improves the more you talk to Rocky. "Not Ana,
+    Anna." renames a name only just learned (a misheard introduction).
+    One face only, and a real match only: with two in view, or a name merely
+    carried by tracking, whose face it is would be a guess -- and a wrong guess
+    becomes training data."""
+    fixed = faces.corrected_name(user_text)
+    if fixed:
+        old, new = fixed
+        (memory.MIND_DIR / "people" / f"{memory.slug(old)}.md").unlink(missing_ok=True)
+        memory.remember("person", new, "name", f"I first misheard {new}'s name as {old}")
+        journal.log("learned", f"{old} is really called {new} -- I misheard the name")
+        return
     data = faces.read()
     embedding, seen = data.get("embedding"), data.get("faces") or []
     if not embedding or not seen:
         return
     name = faces.introduced_name(user_text)
-    if name:
+    if name and len(seen) > 1:
+        journal.log("noticed", f"{name} introduced themselves, but I see {len(seen)} faces -- not sure which is them")
+    elif name:
         n = faces.enroll(name, embedding)
         journal.log("learned", f"what {name} looks like ({n} face sample{'s' if n > 1 else ''})")
         if n == 1:
             memory.remember("person", name, "face", f"I can recognize {name}'s face -- they introduced themselves")
-    elif seen[0].get("name") and seen[0].get("similarity", 1) < 0.55:
+    elif len(seen) == 1 and seen[0].get("name") and faces.MATCH_COSINE <= seen[0].get("similarity", 0) < 0.55:
         faces.enroll(seen[0]["name"], embedding)
 
 
-def _wake_greeting(persona, Reply, woke_from_sleep: bool = False) -> str:
-    """A fresh, in-character greeting from the LLM every time -- no
-    fallback content: if the LLM server's unreachable, say so plainly."""
-    prompt = persona.system_prompt_template(cfg.ALLOWED_ACTIONS, cfg.STATIONARY_ACTIONS)
-    greeting_prompt = journal.inject(
-        "You were ASLEEP and someone just woke you up by saying your name. Greet them with one "
-        "short, sleepy, in-character line." if woke_from_sleep else
-        "Someone just said your wake word. Greet them with one short, in-character line."
-    )
-    result = cognition.ask(
-        cfg.LLM_BASE_URL, cfg.LLM_MODEL, greeting_prompt,
-        system=prompt, json_schema=Reply.model_json_schema(), timeout_s=15.0,
-    )
-    if result.status != cognition.AVAILABLE:
-        print(f"wake greeting: cognition unavailable ({result.status}): {result.error}")
-        dash_events.log_event("safety", f"wake greeting fallback ({result.status})")
-        return persona.transform("Unable to think.")
-    try:
-        data = Reply.model_validate_json(result.text)
-        return persona.transform(data.reply)
-    except Exception as e:
-        print(f"wake greeting parse failed ({e}); raw text: {result.text!r}")
-        return persona.transform(result.text.strip())
+_greetings: list[tuple[str, str | None]] = []  # the next one, written ahead -- see _prepare_greeting
 
 
-def _run_session(persona, Reply, mic: mic_stream.ArecordStream, first_text: str | None = None) -> None:
+def _prepare_greeting(persona) -> None:
+    """Writes the NEXT greeting now, in the background, so a bare "Rocky" is
+    answered at once instead of after an LLM round (~1-2s of silence that read
+    as not having heard). Still fresh each time: one line, used once."""
+    def _run() -> None:
+        _greetings[:] = [_wake_greeting(persona, prepared=False)]
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _wake_greeting(persona, prepared: bool = True) -> tuple[str, str | None]:
+    """(greeting, gesture): fresh from the LLM every time -- no fallback
+    content: if the LLM server's unreachable, say so plainly.
+    `prepared`: take the one written ahead if there is one."""
+    if prepared and _greetings:
+        return _greetings.pop()
+    return react.line(persona, "Someone just said your name to get your attention. Greet them.",
+                      "Unable to think.", timeout_s=15.0)
+
+
+def _seed_history(opener: str | None) -> list[dict]:
+    """Where the last conversation left off (journal), and the line the mind
+    just said if it opened this one -- so a new session continues a
+    relationship instead of starting from nothing."""
+    history: list[dict] = []
+    last = journal.last_conversation(datetime.datetime.now() - datetime.timedelta(minutes=10))
+    if last:
+        when, lines = last
+        history += [{"role": "user", "content": f"(Your last conversation, {when} -- for continuity, don't recite it:)\n"
+                                                + "\n".join(lines)},
+                    {"role": "assistant", "content": json.dumps({"tone_action": "none", "reply": "(remembered)"})}]
+    if opener:
+        history += [{"role": "user", "content": "(nobody said anything yet)"},
+                    {"role": "assistant", "content": json.dumps({"tone_action": "none", "reply": opener})}]
+    return history
+
+
+def _run_session(persona, Reply, mic: mic_stream.ArecordStream, first_text: str | None = None,
+                 opener: str | None = None) -> None:
     """Open until "stop session" or "go to sleep" -- silence, long pauses and
     unintelligible audio never end it. (After CONVERSATION_IDLE_S of nobody
     speaking, the mind starts thinking again while the session stays open --
-    see state.conversation_active.)"""
+    see state.conversation_active.) `opener`: the mind spoke first and they answered."""
     woke_from_sleep = bool(state.load_session().get("asleep"))
     try:
         state.update_session({"in_session": True, "listening": True, "asleep": False,
                               "last_activity_ts": time.time()})
-        if woke_from_sleep:
+        if woke_from_sleep:  # "Rocky, wake up, <instruction>" in one breath
             journal.log("woke", "someone woke me up")
             dash_events.log_event("wake", "woke up")
-        motor_dispatch(["wave hands"])  # stationary wake acknowledgment; ends with the head centred
-        history: list[dict] = []
-        journal.log("woke", "someone said my name")
+        history = _seed_history(opener)
+        journal.log("woke", "they answered me" if opener else "someone said my name")
         if first_text:  # "Rocky, <instruction>" in one breath: answer it, no greeting
             keep_going, interrupted = _run_turn(persona, Reply, first_text, history, mic)
             if not keep_going:
                 return
         else:
-            greeting = _wake_greeting(persona, Reply, woke_from_sleep)
+            greeting, tone = _wake_greeting(persona)
+            if tone:
+                motor_dispatch([tone])  # the greeting's own gesture -- the LLM's pick, not a fixed wave
             dash_events.log_event("reply", f"wake greeting: {greeting}")
             journal.log("said", greeting)
             _, cut_by = _speak_interruptible(persona, [greeting], mic)
@@ -574,16 +753,21 @@ def _run_session(persona, Reply, mic: mic_stream.ArecordStream, first_text: str 
             if not interrupted:
                 mic.flush()  # drop Rocky's own voice; after a barge-in, keep what the person is already saying
             spec_out: dict = {}
-            _, text = _listen(mic, 60.0, speculate=lambda audio, heard_from: _Speculation(
-                persona, Reply, audio, heard_from, history), spec_out=spec_out)
+            audio, text = _listen(mic, 60.0, speculate=lambda audio, heard_from: _Speculation(
+                persona, Reply, audio, heard_from, history), spec_out=spec_out,
+                stop=lambda: bool(state.load_session().get("remote_command")))
+            if not _do_remote(persona, mic, in_session=True):  # texted /be-quiet or /go-to-sleep
+                break
             if not text:
                 interrupted = False  # nothing heard in a minute -> just keep listening
                 continue
-            keep_going, interrupted = _run_turn(persona, Reply, text, history, mic, spec=spec_out.get("spec"))
+            keep_going, interrupted = _run_turn(persona, Reply, text, history, mic, spec=spec_out.get("spec"),
+                                                audio=audio)
             if not keep_going:
                 break
     finally:
         state.update_session({"in_session": False, "listening": False})
+        _prepare_greeting(persona)  # for the next "Rocky"
 
 
 CONTINUE_WAIT_S = 1.2  # after "Rocky", how long to wait for "...go to sleep" before greeting
@@ -602,16 +786,27 @@ def _on_wake(persona, Reply, mic: mic_stream.ArecordStream, seed: bytes) -> None
         # what time is it"), the whole phrase is already in `seed`: Vosk only
         # reports the name once the phrase ends. Missing this refused "Rocky,
         # wake up" four times in a row (2026-10-02).
-        text = _whisper.transcribe(seed)
+        text = _whisper.transcribe(seed) or ""
+        print(f"stt: wake seed ({len(seed) / (2 * MIC_RATE):.1f}s) -> whisper {text!r}")
     words = stt._words(text)
+    fillers = (_wake_name(persona), "hey", "hi", "ok", "okay")
     if state.load_session().get("asleep"):
-        if "wake up" in " ".join(words):
-            _run_session(persona, Reply, mic)  # sleepy greeting
-        else:
+        joined = " ".join(words)
+        if "wake up" not in joined:
             dash_events.log_event("wake", f"heard {text or 'my name'!r} while asleep -- only \"{persona.name}, wake up\" wakes me")
+            return
+        # "Rocky, wake up" alone: back to awake-in-the-background, like "be quiet"
+        # leaves it -- no conversation, no greeting. With more after it ("wake up,
+        # what time is it"), that's the first turn.
+        rest = [w for w in joined.split("wake up", 1)[1].split() if w not in fillers]
+        if rest:
+            _run_session(persona, Reply, mic, first_text=" ".join(rest))
+        else:
+            _wake_up(persona, mic)
         return
-    instruction = [w for w in words if w not in (_wake_name(persona), "hey", "hi", "ok", "okay")]
-    dash_events.log_event("wake", f"user: {text or _wake_name(persona)}")
+    instruction = [w for w in words if w not in fillers]
+    if not instruction:  # with one, _run_turn logs it
+        dash_events.log_event("wake", f"user: {text or _wake_name(persona)}")
     _run_session(persona, Reply, mic, first_text=text if instruction else None)
 
 
@@ -619,6 +814,31 @@ def _wake_name(persona) -> str:
     """The word that wakes it: the persona's name, last word if it has several.
     Must be a word the Vosk model knows -- pick a plain, common one."""
     return persona.name.lower().split()[-1]
+
+
+def _label_sound(recent: deque) -> None:
+    """The last second of audio, the moment the room got loud -> what it was (common/sounds.py)."""
+    audio = b""
+    for _, chunk in reversed(recent):
+        audio = chunk + audio
+        if len(audio) >= MIC_RATE * 2:
+            break
+    top = _sounds.classify(resample_pcm(audio, MIC_RATE, VOSK_RATE))
+    sounds.publish(top)
+    print(f"sounds: {top}")
+
+
+def _load_senses() -> None:
+    """Sound names and voice prints, in the background -- optional: no model, no names."""
+    global _sounds, _voices
+    try:
+        _sounds = sounds.Classifier()
+    except Exception as e:
+        print(f"sounds: off ({e})")
+    try:
+        _voices = voices.VoiceEngine()
+    except Exception as e:
+        print(f"voices: off ({e})")
 
 
 def _load_whisper() -> None:
@@ -640,7 +860,7 @@ def _load_whisper() -> None:
 def main() -> None:
     global _wake_model
     persona = persona_mod.load()
-    Reply = reply_schema.build_reply_model(cfg.STATIONARY_ACTIONS)
+    Reply = reply_schema.build_reply_model(cfg.TONE_ACTIONS)
     health.start_watchdog(COMPONENT, cfg.WATCHDOG_STALE_SEC, cfg.WATCHDOG_PING_INTERVAL)
     # A kill mid-session (watchdog, crash) skips _run_session's finally --
     # without this reset, in_session stays True and mind/alive stay frozen.
@@ -658,6 +878,8 @@ def main() -> None:
     wake_rec.SetWords(True)  # word timings: where "Rocky" started in the stream
 
     threading.Thread(target=_load_whisper, daemon=True).start()
+    threading.Thread(target=_load_senses, daemon=True).start()
+    _prepare_greeting(persona)
 
     print(f"{COMPONENT}: listening for {wake_phrases}")
     health.record_success(COMPONENT)
@@ -669,6 +891,7 @@ def main() -> None:
     fed_s = 0.0
     levels: deque[float] = deque(maxlen=30)  # per-second peak loudness, for openbot-mind's surprise detection
     second_peak, next_publish = 0.0, time.time() + 1.0
+    next_invite_check = 0.0
     while True:
         health.record_success(COMPONENT, min_interval_s=5.0)
         chunk = mic.read(chunk_frames)
@@ -683,9 +906,35 @@ def main() -> None:
         if time.time() >= next_publish:
             levels.append(round(second_peak))
             sensors.publish_hearing(list(levels))
+            if _sounds is not None and not speak_mod.playing() and surprise.loudness_events(list(levels)):
+                _label_sound(recent)  # the mind's "a sudden sound" gets a name
             second_peak, next_publish = 0.0, time.time() + 1.0
         if speak_mod.playing():
             continue  # its own voice ("Rocky ready!") must not count as its name
+        if time.time() >= next_invite_check:
+            next_invite_check = time.time() + 1.0
+            invite = state.load_session()
+            if invite.get("remote_command"):  # texted on WhatsApp: done as if just said
+                _do_remote(persona, mic, in_session=False)
+                continue
+            remaining = invite.get("invite_until", 0) - time.time()
+            if remaining > 0:
+                # The mind just said something on its own: listen for an answer without the wake
+                # word, for the rest of the window. An answer opens a normal conversation.
+                state.update_session({"invite_until": 0, "in_session": True, "listening": True,
+                                      "last_activity_ts": time.time()})
+                mic.flush()
+                _, text = _listen(mic, remaining)
+                if text:
+                    dash_events.log_event("wake", f"answered without the wake word: {text}")
+                    _run_session(persona, Reply, mic, first_text=text, opener=invite.get("invite_text"))
+                else:
+                    state.update_session({"in_session": False, "listening": False})
+                wake_rec = vosk.KaldiRecognizer(wake_model, VOSK_RATE, grammar)
+                wake_rec.SetWords(True)
+                recent.clear()
+                fed_s = 0.0
+                continue
         resampled = resample_pcm(chunk, MIC_RATE, VOSK_RATE)
         recent.append((fed_s, chunk))
         fed_s += chunk_frames / mic.rate

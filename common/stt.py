@@ -3,8 +3,8 @@
 started and stopped talking -- it hears words, which a loudness threshold
 can't. Whisper then transcribes the recording for WHAT you said: Vosk's
 small model heard "rocky come you tell me..." where Whisper got "can you
-tell me..." right. Vosk's own transcript is the fallback if Whisper is
-unavailable or returns nothing.
+tell me..." right. Vosk's own transcript is the fallback only if no Whisper
+can be asked -- when Whisper says it was noise, it was noise.
 
 Measured on the Pi 5 (2026-10-02, beam 1, no timestamps): base.en ~2.1s
 per utterance, tiny.en ~1.1s (same on clear speech; base handles accents
@@ -27,6 +27,10 @@ MIC_RATE = 44100
 PHANTOM_PHRASES = {
     "thank you", "thanks for watching", "you", "the", "a", "and", "is",
     "bye", "so", "i'm sorry", "subscribe",
+    # What the whisper-server writes (with PROMPT) for room noise or a mumble --
+    # reproduced from plain noise; taken as the user 6 times on 2026-10-02.
+    "you can see the next one", "see you in the next one", "you can see the camera",
+    "you can see the light", "you can see the light on the screen", "you can see the surroundings",
 }
 
 
@@ -54,7 +58,7 @@ def reject_hallucination(text: str) -> str:
     """Shared post-filter: phantom phrases, non-ASCII-dominant text,
     repetitive word salad. Returns "" if `text` looks like a
     hallucination rather than real speech."""
-    if not text:
+    if not _words(text):  # "." / "- -": Whisper's transcript of noise has no words
         return ""
     stripped = text.lower().strip(".!? ")
     if stripped in PHANTOM_PHRASES:
@@ -143,7 +147,9 @@ class RemoteWhisper:
         from .cognition import _known
         return f"http://{urlparse(_known(self.llm_base_url)).hostname}:{self.port}/inference"
 
-    def transcribe(self, pcm_44100: bytes) -> str:
+    def transcribe(self, pcm_44100: bytes) -> str | None:
+        """None: no Whisper to ask (use Vosk's words). "": Whisper heard only
+        noise -- that verdict must not fall back to Vosk's guess at it."""
         import io, wave
         import requests
         wav = io.BytesIO()
@@ -160,7 +166,7 @@ class RemoteWhisper:
             return reject_hallucination(str(resp.json().get("text", "")).strip())
         except (requests.RequestException, ValueError) as e:
             print(f"stt: Mac whisper unavailable ({type(e).__name__}) -- using the Pi's")
-            return self.fallback.transcribe(pcm_44100) if self.fallback else ""
+            return self.fallback.transcribe(pcm_44100) if self.fallback else None
 
 
 def demo() -> None:
@@ -168,6 +174,7 @@ def demo() -> None:
     assert reject_hallucination("okay okay okay okay okay okay") == ""
     assert reject_hallucination("turn left please") == "turn left please"
     assert reject_hallucination("") == ""
+    assert reject_hallucination(".") == "" and reject_hallucination("You can see the next one.") == ""
 
     assert vosk_text([{"text": "turn left"}, {"text": ""}, {"text": "please"}]) == "turn left please"
     assert vosk_text([]) == "" and vosk_text([{"text": "thank you"}]) == ""  # phantom phrase

@@ -145,6 +145,95 @@ def _safety_backward(car: Picarx, duration: float = 0.8) -> None:
 actions_dict["safety backward"] = _safety_backward
 
 
+# What each gesture is for -- the one place prompts take it from (config.GESTURE_GUIDE), so
+# a persona or a service never has to name this body's actions. Another body: write its own.
+GESTURE_GUIDE = {
+    "celebrate": "something good or happy", "nod": "agreement, something good",
+    "depressed": "something bad or sad", "shake head": "disagreement, something bad",
+    "resist": "annoyed or defensive", "rub hands": "playful or amused",
+    "think": "uncertain, working something out", "wave hands": "a greeting",
+    "act cute": "being adorable on purpose", "twist body": "a little wiggle of excitement",
+    "curious": "interest, a question", "happy": "joy", "excited": "big news",
+    "sad": "sympathy", "shy": "embarrassed or flattered",
+    "fist bump": "a friendly nudge forward -- when a hand is held out to you",
+    "bullfight": "a playful charge -- when something is right in front of you",
+    "dance": "a circle and a figure 8 -- when there's room on the floor",
+}
+
+
+# --- emotes: eased head poses (after adrianwedd/spark's px-emote) ------------------
+# Camera gimbal only -- stationary, so they land in STATIONARY_ACTIONS and the LLM can
+# pick them as a reply's tone or a reflection's gesture. (pan, tilt, ease_s, hold_s);
+# pan + = right, tilt + = up. "thinking"/"idle"/"alert" from the original are skipped:
+# the preset "think" and "look ahead" already cover them.
+EMOTES = {
+    "curious": (25, 18, 0.7, 0.5),   # + a small tilt-nod
+    "happy":   (0, 12, 0.5, 0.0),    # + side-to-side sweep
+    "excited": (0, 15, 0.4, 0.0),    # + rapid pan sweep
+    "sad":     (-10, -20, 1.2, 1.0),
+    "shy":     (-40, 5, 0.8, 0.6),
+}
+
+
+def _ease_head(car: Picarx, from_pan: float, from_tilt: float, to_pan: float, to_tilt: float, duration: float) -> None:
+    steps = max(2, int(duration * 20))
+    for i in range(steps + 1):
+        t = i / steps
+        car.set_cam_pan_angle(round(from_pan + (to_pan - from_pan) * t))
+        car.set_cam_tilt_angle(round(from_tilt + (to_tilt - from_tilt) * t))
+        if i < steps:
+            time.sleep(duration / steps)
+
+
+def _emote(name: str):
+    pan, tilt, ease_s, hold_s = EMOTES[name]
+
+    def act(car: Picarx) -> None:
+        _ease_head(car, 0, 0, pan, tilt, ease_s)  # gestures start centred (the tracker/presets leave it there)
+        if name == "happy":
+            for _ in range(2):
+                _ease_head(car, pan, tilt, 20, tilt, 0.25)
+                _ease_head(car, 20, tilt, -20, tilt, 0.35)
+                _ease_head(car, -20, tilt, 0, tilt, 0.25)
+        elif name == "excited":
+            last = pan
+            for deg in (35, -35, 25, -25, 0):
+                _ease_head(car, last, tilt, deg, tilt, 0.18)
+                last = deg
+        elif name == "curious":
+            _ease_head(car, pan, tilt, pan, tilt + 5, 0.3)
+            _ease_head(car, pan, tilt + 5, pan, tilt, 0.3)
+        time.sleep(hold_s)
+        _ease_head(car, 0 if name in ("happy", "excited") else pan, tilt, 0, 0, 0.5)  # back to centre, like every preset
+    return act
+
+
+for _name in EMOTES:
+    actions_dict[_name] = _emote(_name)
+
+
+def _dance(car: Picarx, speed: int = 28, circle_s: float = 3.0, eight_s: float = 2.0) -> None:
+    """A circle, then a figure 8 (after spark's px-dance) -- wheels, so it's a
+    MOVEMENT action: a spoken "dance", or the mind's pick when the robot lives
+    on the floor (config.PLAYFUL_ACTIONS). Cliff-checked every 50ms like every
+    drive here, but an arc meets a table edge at any angle: floor only."""
+    import config as cfg
+    car.set_cam_tilt_angle(10)
+    for angle, duration in ((30, circle_s), (-30, eight_s), (30, eight_s)):
+        car.set_dir_servo_angle(angle)
+        time.sleep(0.15)
+        car.forward(speed)
+        _drive_while_checking_cliff(car, duration, cfg.CLIFF_REFERENCE, "cliff ahead -- stopping the dance")
+        if is_real_cliff(car.get_grayscale_data(), cfg.CLIFF_REFERENCE):
+            break
+    car.stop()
+    car.set_dir_servo_angle(0)
+    car.set_cam_tilt_angle(0)
+
+
+actions_dict["dance"] = _dance
+
+
 # Head turns for openbot-mind's `look` tool -- camera gimbal only, never the
 # wheels. Excluded from STATIONARY_ACTIONS in config.py: they're a sensing
 # tool, not an emotional tone_action or an idle gesture.

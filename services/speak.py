@@ -63,11 +63,14 @@ def _set_playing(on: bool) -> None:
 
 
 def _record_said(text: str, start: float, end: float) -> None:
-    """See speak_client.SAID_LOG. Keeps the last 50 lines."""
+    """See speak_client.SAID_LOG. Keeps the last 50 lines. Called as a line
+    starts (end = a generous guess) and again when it ends: the listener
+    transcribes at pauses mid-line, and an entry written only at the end came
+    too late -- Rocky's own words were answered as the person's."""
     try:
         try:
             with open(SAID_LOG) as f:
-                lines = f.readlines()[-49:]
+                lines = [x for x in f.readlines() if f'"start": {json.dumps(start)},' not in x][-49:]
         except OSError:
             lines = []
         lines.append(json.dumps({"text": text, "start": start, "end": end}) + "\n")
@@ -179,6 +182,7 @@ def _handle(conn: socket.socket) -> None:
             _set_playing(True)
             said_start = time.time()
             try:
+                _record_said(text, said_start, said_start + 2.0 + len(text) / 8)  # replaced in finally
                 if persona.speak_overlay is not None:
                     persona.speak_overlay(text, piper, should_stop=_stop.is_set)
                 else:

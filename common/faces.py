@@ -60,7 +60,7 @@ class FaceEngine:
                                              (width, height), 0.7)
         self.rec = cv2.FaceRecognizerSF.create(str(MODEL_DIR / "face_recognition_sface_2021dec.onnx"), "")
         self.known: dict[str, "object"] = {}
-        self._known_mtime = 0.0
+        self._known_sig: list = []
         self._last_recognized = 0.0
         self._prev: list[tuple[float, float, str | None, float]] = []  # (cx, cy, name, similarity)
         self._prev_seen = 0.0
@@ -68,10 +68,11 @@ class FaceEngine:
 
     def _reload_known(self) -> None:
         import numpy as np
-        mtime = max((p.stat().st_mtime for p in KNOWN_DIR.glob("*.npy")), default=0.0)
-        if mtime != self._known_mtime:
-            self.known = {p.stem: np.load(p) for p in KNOWN_DIR.glob("*.npy")}
-            self._known_mtime = mtime
+        files = sorted(KNOWN_DIR.glob("*.npy"))
+        sig = [(p.name, p.stat().st_mtime) for p in files]  # names too: a rename or delete keeps the newest mtime
+        if sig != self._known_sig:
+            self.known = {p.stem: np.load(p) for p in files}
+            self._known_sig = sig
 
     def analyze(self, jpeg: bytes) -> dict:
         """{w, h, faces: [{box: [x,y,w,h], score, name|None, similarity}], embedding (biggest face)}"""
@@ -166,6 +167,16 @@ def visible_names(data: dict) -> tuple[list[str], int]:
     return [n.replace("-", " ").title() for n in names], sum(1 for f in faces if not f.get("name"))
 
 
+def speaker(data: dict) -> str | None:
+    """Who is talking: the one face in view, if recognized. With two faces
+    or a stranger it's a guess, so None -- route 1 of voice-to-person (the
+    face stands in for the voice); speaker-ID from audio is the upgrade."""
+    faces = data.get("faces", [])
+    if len(faces) == 1 and faces[0].get("name"):
+        return faces[0]["name"].replace("-", " ").title()
+    return None
+
+
 def describe(data: dict) -> str | None:
     names, strangers = visible_names(data)
     if not names and not strangers:
@@ -186,7 +197,7 @@ def enroll(name: str, embedding: list[float]) -> int:
 
 
 # Phrase case-insensitive, name case-SENSITIVE (scoped (?i:...) flag).
-NAME_INTRO = re.compile(r"\b(?i:my name is|call me|i am|i'm|this is)\s+([A-Z][a-z]+)\b")
+NAME_INTRO = re.compile(r"\b(?i:my name is|call me|i am|i'm)\s+([A-Z][a-z]+)\b")
 
 
 def introduced_name(transcript: str) -> str | None:
@@ -194,6 +205,25 @@ def introduced_name(transcript: str) -> str | None:
     Whisper capitalizes names, not "I am feeling tired"."""
     m = NAME_INTRO.search(transcript)
     return m.group(1) if m and m.group(1).lower() not in {CURRENT, "not", "just", "here", "back", "sorry"} else None
+
+
+# "Not Ana, Anna." / "Her name is not Ana. Her name is Anna." -- fixes a misheard introduction.
+CORRECTION = re.compile(r"\b(?i:not)\s+([A-Z][a-z]+)\W+(?:(?i:it['’]?s|that['’]?s|i['’]?m|(?:her|his|my) name is)\s+)?"
+                        r"([A-Z][a-z]+)\b")
+JUST_LEARNED = 3  # samples: only a name this new can be renamed by voice -- "Not Atul, Daddy!" must never rename Atul
+
+
+def corrected_name(transcript: str) -> tuple[str, str] | None:
+    """(old, new) if `transcript` corrects a name only just learned -- and renames its face file."""
+    import numpy as np
+    m = CORRECTION.search(transcript)
+    if not m or name_slug(m[2]) in (CURRENT, name_slug(m[1])):  # "It's not Aria, it's Aria."
+        return None
+    src, dst = KNOWN_DIR / f"{name_slug(m[1])}.npy", KNOWN_DIR / f"{name_slug(m[2])}.npy"
+    if not src.exists() or dst.exists() or len(np.load(src)) > JUST_LEARNED:
+        return None
+    os.replace(src, dst)
+    return m[1], m[2]
 
 
 def head_step(face_box: list[int], frame_wh: tuple[int, int], pan: float, tilt: float) -> tuple[float, float] | None:
@@ -217,6 +247,9 @@ def head_step(face_box: list[int], frame_wh: tuple[int, int], pan: float, tilt: 
 def demo() -> None:
     import shutil, tempfile
     import numpy as np
+    assert speaker({"faces": [{"name": "atul-p"}]}) == "Atul P"
+    assert speaker({"faces": [{"name": "atul"}, {}]}) is None  # a stranger too: whose voice? a guess
+    assert speaker({"faces": [{}]}) is None and speaker({}) is None
     global KNOWN_DIR, FACES_PATH
     orig = (KNOWN_DIR, FACES_PATH)
     test_dir = Path(tempfile.mkdtemp())
@@ -233,6 +266,14 @@ def demo() -> None:
         assert describe({}) is None
         assert introduced_name("Hi, my name is Atul.") == "Atul" and introduced_name("I'm Priya") == "Priya"
         assert introduced_name("I am feeling tired") is None and introduced_name(f"I'm {CURRENT.capitalize()}'s friend") is None
+        assert introduced_name("This is Anna") is None  # might be someone else's face
+        enroll("Ana", list(b))  # a misheard introduction...
+        assert corrected_name("Also her name is not Ana. Her name is Anna.") == ("Ana", "Anna")
+        assert (KNOWN_DIR / "anna.npy").exists() and not (KNOWN_DIR / "ana.npy").exists()
+        assert corrected_name("It's not Anna, it's Anna.") is None and corrected_name("Not Ravi, Sam.") is None
+        for _ in range(JUST_LEARNED):
+            enroll("Atul", list(a))
+        assert corrected_name("Not Atul, Daddy!") is None and (KNOWN_DIR / "atul.npy").exists()  # familiar: never renamed
         # face right of centre -> pan right; below centre -> tilt down; centred -> no move
         assert head_step([500, 200, 80, 80], (640, 480), 0, 0)[0] > 0
         assert head_step([280, 400, 80, 60], (640, 480), 0, 0)[1] < 0

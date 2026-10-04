@@ -73,6 +73,28 @@ def remember(kind: str, about: str, category: str, text: str) -> Path:
     return path
 
 
+def write_note(kind: str, about: str, lines: list[str], category: str = "note") -> Path:
+    """Replaces the note for `about` with these lines -- for knowledge that is
+    re-derived whole (what works with people), unlike remember()'s append."""
+    if kind not in KINDS:
+        raise ValueError(f"kind must be one of {sorted(KINDS)}")
+    about = one_line(about, 60) or "general"
+    path = ensure_note(KINDS[kind], about, about, kind)
+    head = path.read_text(encoding="utf-8").split("---\n", 2)
+    body = "".join(f"- [{slug(category)[:20] or 'note'}] {one_line(t)}\n" for t in lines if one_line(t))
+    path.write_text(f"---\n{head[1]}---\n\n{body}", encoding="utf-8")
+    return path
+
+
+def read_note(kind: str, about: str) -> list[str]:
+    """The note's lines (without frontmatter), [] if none."""
+    try:
+        return [ln for ln in (MIND_DIR / KINDS[kind] / f"{slug(about)}.md").read_text(encoding="utf-8")
+                .split("---\n", 2)[-1].splitlines() if ln.startswith("- ")]
+    except (OSError, KeyError):
+        return []
+
+
 # --- Basic Memory MCP client (streamable HTTP) ------------------------------
 
 _session: str | None = None
@@ -167,6 +189,11 @@ def demo() -> None:
             raise AssertionError("expected ValueError")
         except ValueError:
             pass
+        write_note("self", "what works", ["ask about their day", "skip time checks"], "rule")
+        write_note("self", "what works", ["ask about their day"], "rule")  # replaced, not appended
+        assert read_note("self", "what works") == ["- [rule] ask about their day"]
+        assert (MIND_DIR / "self" / "what-works.md").read_text().count("permalink") == 1
+        assert read_note("self", "nothing here") == []
         assert recall("") == [] and recall("anything") is None  # server unreachable -> None, never raises
     finally:
         MIND_DIR, MEMORY_URL = orig_dir, orig_url

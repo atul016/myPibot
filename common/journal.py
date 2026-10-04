@@ -69,6 +69,20 @@ def entries(day: dt.date) -> list[str]:
     return _entries(day)
 
 
+def last_conversation(before: dt.datetime, n: int = 6, days: int = 7) -> tuple[str, list[str]] | None:
+    """(when, lines): the last few heard/said lines older than `before`, so a
+    new conversation can pick up where the previous one left off. None if
+    nothing in `days` days."""
+    day = before.date()
+    for back in range(days):
+        d = day - dt.timedelta(days=back)
+        talk = [e for e in _entries(d) if e.startswith(("[heard]", "[said]"))
+                and (back or e.split()[1] < before.strftime("%H:%M"))]
+        if talk:
+            return ("earlier today" if not back else "yesterday" if back == 1 else f"{d:%A}"), talk[-n:]
+    return None
+
+
 # --- rolling summary ---------------------------------------------------------
 
 def _summary_path(day: dt.date) -> Path:
@@ -99,15 +113,23 @@ def inject(prompt_text: str, query: str = "") -> str:
     turn, the wake greeting and proximity reactions, so they can't drift
     apart. (The mind loop builds its own richer awareness dict.)"""
     import time
-    from . import faces, vision  # deferred: vision imports cognition; keep this module light
+    from . import faces, objects, state, tools, vision  # deferred: vision imports cognition; keep this module light
 
-    sections = []
+    weather = tools.weather()
+    sections = [f"It's {tools.now_words()}." + (f" Weather outside -- {weather}" if weather else "")]
     look = vision.last_look()
     if look.get("scene") and time.time() - look.get("ts", 0) < 600:
-        sections.append(f"What you can see through your camera right now: {look['scene']}")
+        sections.append(f"What your camera saw recently (background -- mention it only if asked): {look['scene']}")
+    things = objects.names(objects.read())
+    if things:
+        sections.append(f"Things your camera's object detector sees right now: {things}")
     people = faces.describe(faces.read())
     if people:
         sections.append(f"Who's in front of you right now (from your camera): {people}")
+    session = state.load_session()
+    if session.get("mood"):  # the mind's last reflection -- so Rocky's company matches its private life
+        sections.append(f"How you feel right now: {session['mood']}"
+                        + (f" -- your last private thought was: {session['thought']}" if session.get("thought") else ""))
     summary = read_summary(dt.date.today())
     if summary:
         sections.append(f"Your day so far: {summary}")
@@ -142,6 +164,11 @@ def demo() -> None:
         write_summary(t.date(), "Quiet night, then the lights went out.")
         assert read_summary(t.date()) == "Quiet night, then the lights went out."
         assert read_summary(dt.date(2000, 1, 1)) == ""
+        assert last_conversation(t) == ("yesterday", ["[heard] 23:58 rocky what time is it", "[said] 23:58 late! second line"])
+        log("heard", "morning", now=dt.datetime(2026, 10, 2, 9, 0))
+        assert last_conversation(dt.datetime(2026, 10, 2, 9, 30)) == ("earlier today", ["[heard] 09:00 morning"])
+        assert last_conversation(dt.datetime(2026, 10, 2, 8, 59)) == ("yesterday", ["[heard] 23:58 rocky what time is it", "[said] 23:58 late! second line"])
+        assert last_conversation(dt.datetime(2026, 12, 1)) is None
     finally:
         memory.MIND_DIR, LOCK_PATH = orig_dir, orig_lock
         shutil.rmtree(test_dir, ignore_errors=True)

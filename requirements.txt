@@ -11,3 +11,5 @@ pygame
 vosk
 faster-whisper
 piper-tts
+neonize            # WhatsApp chat (services/chat.py); needs libmagic (apt: file)
+ai-edge-litert     # YAMNet sound names (common/sounds.py); onnxruntime (with piper-tts) runs the voice prints

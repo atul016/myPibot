@@ -23,7 +23,7 @@ vosk.SetLogLevel(-1)
 wl._wake_model = vosk.Model(wl._vosk_model_path())
 wl._whisper = stt.RemoteWhisper(cfg.LLM_BASE_URL, cfg.MAC_WHISPER_PORT, None)
 wl.motor_dispatch = lambda actions, wait=False: True
-persona, Reply = persona_mod.load(), reply_schema.build_reply_model(cfg.STATIONARY_ACTIONS)
+persona, Reply = persona_mod.load(), reply_schema.build_reply_model(cfg.TONE_ACTIONS)
 first_ready: list[float] = []
 
 

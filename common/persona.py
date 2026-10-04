@@ -17,7 +17,9 @@ class Persona:
     wake_words: list[str]
     sleep_words: list[str]
     sleep_ack: str
-    system_prompt_template: Callable[[list[str], list[str]], str]  # (allowed_actions, stationary_actions) -> prompt
+    # (allowed_actions, stationary_actions, gesture_guide) -> prompt. gesture_guide: "name (what it's for); ..."
+    # for the stationary ones (config.describe_actions) -- the body's meanings, so the persona never names actions.
+    system_prompt_template: Callable[[list[str], list[str], str], str]
     piper_voice: str
     transform: Callable[[str], str] = field(default=lambda text: text)
     speak_overlay: Callable[..., None] | None = None  # optional TTS overlay hook: (text, piper_voice, should_stop=callable)
@@ -38,7 +40,7 @@ def demo() -> None:
     assert persona.name
     assert persona.wake_words
     assert persona.transform("test") is not None
-    assert persona.system_prompt_template(["nod"], ["nod"])
+    assert persona.system_prompt_template(["nod"], ["nod"], "nod (agreement)")
 
 
 if __name__ == "__main__":

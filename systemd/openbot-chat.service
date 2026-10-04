@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenBot chat (text the persona on WhatsApp)
+After=network-online.target openbot-memory.service openbot-camera.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=/etc/openbot/openbot.env
+ExecStart=/usr/bin/python3 -u -m services.chat
+Restart=always
+# Listening (wake-listen, Nice=0) must win -- a text can wait a beat.
+Nice=5
+RestartSec=5
+NotifyAccess=main
+WatchdogSec=280
+
+[Install]
+WantedBy=multi-user.target

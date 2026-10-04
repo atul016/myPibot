@@ -9,7 +9,7 @@ USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 
 [ -f "$DIR/openbot.env" ] || { echo "No $DIR/openbot.env -- run setup.sh first (or copy openbot.env.example)"; exit 1; }
 install -d /etc/openbot
-install -m 644 "$DIR/openbot.env" /etc/openbot/openbot.env
+install -m 600 "$DIR/openbot.env" /etc/openbot/openbot.env  # root-only: it can hold API keys (systemd reads it as root)
 # shellcheck source=/dev/null
 set -a; source "$DIR/openbot.env"; set +a
 
@@ -24,6 +24,11 @@ if [ "${OPENBOT_BODY:-none}" = "none" ]; then
   systemctl disable --now openbot-alive 2>/dev/null || true  # no body to drive
 else
   units+=(openbot-alive)
+fi
+if [ -n "${OPENBOT_CHAT_ALLOW:-}" ]; then
+  units+=(openbot-chat)
+else
+  systemctl disable --now openbot-chat 2>/dev/null || true  # nobody may text it: no WhatsApp
 fi
 for unit in "${units[@]}"; do
   systemctl enable "$unit"

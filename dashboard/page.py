@@ -1,8 +1,10 @@
 """Dashboard HTML -- pure string template, no framework/persona dependency,
-so this module stays importable in isolation. Three tabs: Agent loop
-(wake/heard/reply events), Sensors (distance/grayscale/safety-latch state
-+ service health), Camera (Rocky's latest photo + what it made of it, via
-/api/camera.jpg and /api/vision), and Files (browse the raw state/ files
+so this module stays importable in isolation. Tabs: Agent loop
+(wake/heard/reply events + sensors and service health), Mind (its inner life),
+Dreams & wishes (nightly dream notes, wishes, self-written rules), Camera (Rocky's latest photo + what it made of it, via
+/api/camera.jpg and /api/vision), Jev (every question asked of the Jev decision
+model and its answer, via /api/jev), Stats (is it getting better, per day, via
+/api/stats), and Files (browse the raw state/ files
 every service generates). Fed by /api/stream (Server-Sent Events)
 plus /api/files* for the Files tab.
 """
@@ -38,6 +40,13 @@ PAGE = """<!DOCTYPE html>
   .file-content { flex: 1; min-width: 0; }
   .file-content pre { background: #1c1c1c; border-radius: 8px; padding: 12px; overflow: auto;
                        max-height: 560px; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+  .jev pre { background: #151515; border-radius: 6px; padding: 8px; overflow: auto; max-height: 360px;
+             font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+  .jev summary { cursor: pointer; color: #7cf; font-size: 13px; margin-top: 6px; }
+  .stats-wrap { overflow-x: auto; }
+  .stats td, .stats th { padding: 4px 8px; text-align: right; border-bottom: 1px solid #2a2a2a; white-space: nowrap; }
+  .stats th { color: #999; font-weight: normal; font-size: 12px; }
+  .stats td:first-child, .stats th:first-child { text-align: left; }
 </style>
 </head>
 <body>
@@ -45,7 +54,10 @@ PAGE = """<!DOCTYPE html>
 <div class="tabs">
   <div class="tab active" data-tab="live">Agent loop</div>
   <div class="tab" data-tab="mind">Mind</div>
+  <div class="tab" data-tab="dreams">Dreams &amp; wishes</div>
   <div class="tab" data-tab="camera">Camera</div>
+  <div class="tab" data-tab="jev">Jev</div>
+  <div class="tab" data-tab="stats">Stats</div>
   <div class="tab" data-tab="files">Files</div>
 </div>
 
@@ -77,6 +89,21 @@ PAGE = """<!DOCTYPE html>
   </div>
 </div>
 
+<div class="panel" id="panel-dreams">
+  <div class="cols">
+    <div class="col" style="flex:1.4">
+      <div class="card"><b>Dreams</b> <span style="color:#999;font-size:12px">-- each night it goes over the day and keeps what matters</span>
+        <div id="dreams-list" style="margin-top:8px"></div></div>
+    </div>
+    <div class="col">
+      <div class="card"><b>Wishes</b> <span style="color:#999;font-size:12px">-- things it wishes it could do or have; for you to read</span>
+        <div id="dreams-wishes" style="margin-top:6px"></div></div>
+      <div class="card"><b>Rules it wrote for itself</b> <span style="color:#999;font-size:12px">-- what works with people, rewritten nightly</span>
+        <div id="dreams-rules" style="margin-top:6px;font-size:13px"></div></div>
+    </div>
+  </div>
+</div>
+
 <div class="panel" id="panel-camera">
   <div class="cols">
     <div class="col" style="flex:2">
@@ -89,6 +116,21 @@ PAGE = """<!DOCTYPE html>
         last look -- it thinks about a frame every ~90s, or whenever it decides to <code>look</code>.</div>
     </div>
   </div>
+</div>
+
+<div class="panel jev" id="panel-jev">
+  <div class="card" style="color:#999;font-size:13px">Every question asked of Jev (TypeSafe's decision model) --
+    after each of the bot's thoughts: is this worth texting you on WhatsApp? -- with everything sent and Jev's
+    whole answer. Newest first; refreshes while open. All of it is kept, one file a day, in state/jev/ --
+    the training data for a classifier of our own.</div>
+  <div id="jev-list"></div>
+</div>
+
+<div class="panel" id="panel-stats">
+  <div class="card stats-wrap"><b>Is he getting better?</b> <span style="color:#999;font-size:12px">-- per day,
+    newest first. Texts: the ones he started and what came back. Confusion: thoughts that the room changed,
+    "something is moving" notices, and WhatsApp replies that may claim a move a text can't make.</span>
+    <table class="stats" id="stats-table" style="margin-top:8px;border-collapse:collapse;font-size:13px"></table></div>
 </div>
 
 <div class="panel" id="panel-files">
@@ -138,8 +180,66 @@ document.querySelectorAll('.tab').forEach(tab => {
     setStream(tab.dataset.tab === 'camera');
     if (tab.dataset.tab === 'camera') loadCamera();
     if (tab.dataset.tab === 'mind') loadMind();
+    if (tab.dataset.tab === 'dreams') loadDreams();
+    if (tab.dataset.tab === 'jev') loadJev();
+    if (tab.dataset.tab === 'stats') loadStats();
   });
 });
+
+// --- Stats tab ---
+const STAT_COLS = [['day', 'Day'], ['thoughts', 'Thoughts'], ['said', 'Said'], ['heard', 'Heard'],
+  ['texts_started', 'Texts he started'], ['replied', 'Replied'], ['reactions', 'Reactions'], ['no_reply', 'No reply'],
+  ['reply_rate', 'Reply rate'], ['jev_calls', 'Jev calls'], ['jev_said_text', 'Jev said text'],
+  ['room_changed_thoughts', '"Room changed"'], ['moving_notices', '"Something moving"'],
+  ['possible_move_claims', 'Possible false moves'], ['held_back', 'Held back']];
+function loadStats() {
+  fetch('/api/stats').then(r => r.json()).then(days => {
+    const cell = (k, v) => k === 'reply_rate' ? (v === null ? '-' : Math.round(v * 100) + '%') : esc(String(v ?? '-'));
+    document.getElementById('stats-table').innerHTML =
+      '<tr>' + STAT_COLS.map(([, h]) => `<th>${h}</th>`).join('') + '</tr>' +
+      days.map(d => '<tr>' + STAT_COLS.map(([k]) => `<td>${cell(k, d[k])}</td>`).join('') + '</tr>').join('');
+  });
+}
+
+// --- Jev tab ---
+function loadJev() {
+  fetch('/api/jev').then(r => r.json()).then(calls => {
+    document.getElementById('jev-list').innerHTML = calls.map(c => {
+      const q = ((c.request || {}).questions || {}).pick || {};
+      const a = ((c.response || {}).answers || {}).pick;
+      const verdict = a
+        ? `<b style="color:${a.choice === 'text' ? '#9f9' : '#ccc'}">${esc(a.choice)}</b> (confidence ${Number(a.confidence).toFixed(2)})`
+        : `<span style="color:#f77">${esc(c.error || 'no answer')}</span>`;
+      return `<div class="card">` +
+        `<div class="row"><span>${new Date(c.ts * 1000).toLocaleString()}</span>` +
+        `<span>${verdict} &middot; ${c.ms ?? '-'} ms &middot; HTTP ${c.status ?? '-'}</span></div>` +
+        `<div style="margin:6px 0">${esc(q.instructions)}</div>` +
+        Object.entries(q.criteria || {}).map(([k, v]) =>
+          `<div style="font-size:12px;color:#999"><b>${esc(k)}</b>: ${esc(v)}</div>`).join('') +
+        `<details><summary>State sent</summary><pre>${esc(JSON.stringify((c.request || {}).state, null, 2))}</pre></details>` +
+        `<details><summary>Jev's whole answer</summary><pre>${esc(JSON.stringify(c.response ?? null, null, 2))}</pre></details>` +
+        `</div>`;
+    }).join('') || `<div class="card" style="color:#999">No questions yet. Jev is asked after each thought once its
+      API key is set: OPENBOT_JEV_API_KEY in /etc/openbot/jev.env on the robot.</div>`;
+  });
+}
+setInterval(() => {
+  if (document.getElementById('panel-jev').classList.contains('active')) loadJev();
+}, 5000);
+
+// --- Dreams & wishes tab ---
+function loadDreams() {
+  fetch('/api/dreams').then(r => r.json()).then(d => {
+    document.getElementById('dreams-list').innerHTML = (d.dreams || []).map(n =>
+      `<div style="margin-bottom:12px"><div style="color:#c9f;margin-bottom:4px">🌙 ${esc(n.night)}</div>` +
+      `<div style="white-space:pre-wrap;font-size:13px;line-height:1.5">${esc(n.text)}</div></div>`
+    ).join('') || '<div style="color:#999">No dreams yet -- it dreams once a night, after midnight.</div>';
+    document.getElementById('dreams-wishes').innerHTML = (d.wishes || []).map(w => `<div class="row"><span>✨ ${esc(w)}</span></div>`).join('')
+      || '<div style="color:#999">No wishes yet.</div>';
+    document.getElementById('dreams-rules').innerHTML = (d.rules || []).map(r => `<div class="row"><span>${esc(r)}</span></div>`).join('')
+      || '<div style="color:#999">No rules yet -- written after a few days of reactions.</div>';
+  });
+}
 
 // --- Mind tab ---
 const KIND_COLOR = {heard: '#7cf', said: '#9f9', thought: '#ccc', noticed: '#fc6', found: '#c9f', planned: '#f9c',

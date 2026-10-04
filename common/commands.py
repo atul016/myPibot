@@ -18,6 +18,10 @@ import re
 from .persona import CURRENT
 
 STOP_SESSION, SLEEP, LOUDER, SOFTER = "stop_session", "sleep", "louder", "softer"
+WAKE = "wake"  # texted only: a spoken "wake up" goes through the wake word
+# Texted on WhatsApp (services/chat.py), exactly; wake-listen carries them out as if
+# they had been said out loud. "quite": how "quiet" often gets typed, too.
+SLASH = {"/be-quiet": STOP_SESSION, "/be-quite": STOP_SESSION, "/go-to-sleep": SLEEP, "/wake-up": WAKE}
 
 _PHRASES = {
     STOP_SESSION: {"stop session", "end session", "stop the session", "end the session", "session stop",
@@ -55,8 +59,12 @@ def parse(text: str, extra_sleep: list[str] | None = None) -> str | None:
     return None
 
 
-_GO_TO = re.compile(r"^(?:please )?(?:go|drive|move|head|roll)(?: over)? to(?:wards?)? (?:the |that |my |a |your )?(.+?)(?: please)?$")
-_COME = {"come here", "come to me", "come over here", "come over", "come", "come here please", "come closer"}
+# Repeated verbs are fine ("go, move, go to the pink toy"); still anchored, so
+# "I don't want you to go to the kitchen" isn't a drive.
+_GO_TO = re.compile(r"^(?:please )?(?:head|(?:(?:go|drive|move|roll) )*(?:go|drive|move|roll))(?: over)? "
+                    r"to(?:wards?)? (?:the |that |my |a |your )?(.+?)(?: please)?$")
+_COME = {"come here", "come to me", "come over here", "come over", "come", "come here please", "come closer",
+         "come back", "come back here"}
 _EXPLORE = {"explore", "explore the room", "explore around", "go explore", "explore the table", "go exploring",
             "explore a bit", "look around the room"}
 _STOP = {"stop", "stop moving", "stop driving", "halt", "freeze", "stop it", "stop stop", "wait", "hold on",
@@ -95,6 +103,10 @@ def demo() -> None:
     assert parse("Louder!") == LOUDER and parse(f"{n}, volume up") == LOUDER
     assert parse("Quieter please") == SOFTER and parse("too loud") == SOFTER
     assert navigation(f"{n}, go to the pink toy.") == ("approach", "pink toy")
+    assert navigation("Go, move, go to the pink toy.") == ("approach", "pink toy")
+    assert navigation("I don't want you to go to the kitchen") is None
+    assert navigation("move head to the left") is None  # a head move, not a drive
+    assert navigation("Come back.") == ("approach", "person")
     assert navigation("Drive over to my mug please") == ("approach", "mug")
     assert navigation("Come here!") == ("approach", "person") and navigation("explore the room") == ("explore", None)
     assert navigation("Stop!") == ("stop", None) and navigation(f"{n}, stop moving") == ("stop", None)

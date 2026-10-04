@@ -32,7 +32,7 @@ MAX_WATCHES = 5
 WATCH_TTL_S = 12 * 3600
 REMIND_MINUTES = (1, 720)
 WATCHABLE = {"approach", "leave", "sound", "picked_up", "put_down", "battery_low", "scene", "lights_on", "lights_off",
-             "person_arrived", "person_left", "stranger"}
+             "person_arrived", "person_left", "stranger", "motion"}
 
 _GOAL = re.compile(r"^- \[(open|done|dropped)\] (\d{4}-\d\d-\d\d \d\d:\d\d) \| (.*)$")
 

@@ -7,16 +7,32 @@ to an explicit move command is a much worse failure than an occasional
 over-eager trigger, so movement is decided here, not by the LLM -- the
 reactive voice-loop turn uses this function's result as the sole source of
 truth for whether the robot moves, hardware-generic and persona-independent.
+
+Driving needs the WHOLE utterance to be the command (after dropping the
+bot's name and politeness words), like common/commands.py's navigation --
+searching inside sentences drove the car on "welcome back", "I'm back" and
+"go ahead and tell me". Fist bump and bullfight are unusual enough to be
+found anywhere in a sentence.
 """
 from __future__ import annotations
 
 import re
 
-_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\bturn\s+left\b", re.I), "turn left"),
-    (re.compile(r"\bturn\s+right\b", re.I), "turn right"),
-    (re.compile(r"\b(go\s+)?back(ward)?s?\b|\breverse\b", re.I), "backward"),
-    (re.compile(r"\b(go\s+)?forward\b|\bahead\b", re.I), "forward"),
+from common.persona import CURRENT
+
+# "Rocky, can you go back a little bit please?" -> "go back"
+_FILLER = {CURRENT, "hey", "hi", "ok", "okay", "please", "now", "just", "can", "could", "would", "you",
+           "a", "little", "bit", "again"}
+_DRIVE = {phrase: action for action, phrases in {
+    "forward": {"forward", "go forward", "move forward", "come forward", "drive forward",
+                "ahead", "move ahead", "drive ahead", "go straight", "go straight ahead"},
+    "backward": {"back", "go back", "move back", "back up", "backward", "backwards", "go backward",
+                 "go backwards", "move backward", "move backwards", "drive back", "reverse", "back off"},
+    "turn left": {"turn left", "go left"},
+    "turn right": {"turn right", "go right"},
+    "dance": {"dance", "dance for me", "do dance", "do your dance", "show me dance", "let's dance", "dance time"},
+}.items() for phrase in phrases}
+_ANYWHERE: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bfist\s*bump\b|\bbump\s+fists?\b", re.I), "fist bump"),
     (re.compile(r"\bbull\s*fight\b", re.I), "bullfight"),
 )
@@ -28,7 +44,10 @@ def detect_movement_keyword(heard_text: str | None) -> str | None:
     LLM's reply. Returns None on no match (including empty/None input)."""
     if not heard_text:
         return None
-    for pattern, action in _PATTERNS:
+    words = [w for w in re.findall(r"[a-z']+", heard_text.lower()) if w not in _FILLER]
+    if " ".join(words) in _DRIVE:
+        return _DRIVE[" ".join(words)]
+    for pattern, action in _ANYWHERE:
         if pattern.search(heard_text):
             return action
     return None
@@ -50,6 +69,15 @@ def demo() -> None:
     assert detect_movement_keyword("go back please") == "backward"
     assert detect_movement_keyword("turn left now") == "turn left"
     assert detect_movement_keyword("what's the weather") is None
+    assert detect_movement_keyword(f"{CURRENT.capitalize()}, move ahead.") == "forward"
+    assert detect_movement_keyword("Come forward.") == "forward"
+    assert detect_movement_keyword("Can you go back a little bit, please?") == "backward"
+    for chat in ("Welcome back!", "I'm back.", "My back hurts.", "Go ahead and tell me a story.",
+                 "Go ahead.", "Come back.", "Right.", "I went back home", "turn left and then right"):
+        assert detect_movement_keyword(chat) is None, chat
+    assert detect_movement_keyword("Let's do a fist bump!") == "fist bump"
+    assert detect_movement_keyword(f"{CURRENT.capitalize()}, dance for me please!") == "dance"
+    assert detect_movement_keyword("Do you like to dance?") is None
     assert detect_movement_keyword(None) is None
     assert is_affirmative("yes please")
     assert not is_affirmative("no thanks")

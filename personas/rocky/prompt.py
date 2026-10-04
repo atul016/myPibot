@@ -1,7 +1,8 @@
 """Rocky's system prompt -- persona-specific voice/instructions, not
-framework logic. `allowed_actions`/`stationary_actions` are the hardware's
-own action vocabulary (from config.py -- both empty with no body), passed
-in rather than imported, so this module has no hardware dependency of its own.
+framework logic. `allowed_actions`/`stationary_actions`/`gesture_guide` are the
+hardware's own action vocabulary and what each gesture is for (from config.py --
+all empty with no body), passed in rather than imported, so this module has no
+hardware dependency of its own and names no action itself.
 """
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ PERSONA_VOICE = (
 )
 
 
-def build_system_prompt(allowed_actions: list[str], stationary_actions: list[str]) -> str:
+def build_system_prompt(allowed_actions: list[str], stationary_actions: list[str], gesture_guide: str = "") -> str:
     if not stationary_actions:  # no body: just a voice
         return (
             PERSONA_VOICE + "\n\n"
@@ -32,11 +33,8 @@ def build_system_prompt(allowed_actions: list[str], stationary_actions: list[str
         "just fill each one in per the rules below.\n"
         f"tone_action must always be set, to match the EMOTIONAL TONE of your "
         f"own reply -- every reply has some tone. Choose only from these "
-        f"(they don't move the wheels): {', '.join(stationary_actions)}. As a "
-        "guide: celebrate/nod for something good or happy; depressed/shake "
-        "head for something bad or sad; resist for annoyed or defensive; rub "
-        "hands for playful or amused; think for uncertain or working "
-        "something out; wave hands for a greeting.\n"
+        f"(they don't move the wheels): {gesture_guide or ', '.join(stationary_actions)}. "
+        "If the moment calls for something more, you'll be told what else is allowed right then.\n"
         "Your `reply` must NEVER mention, name, or hint at tone_action in "
         "any form or tense -- not \"I'll nod\", not \"nodding now\", and not "
         "just the bare word \"nod\" either. The action is performed "

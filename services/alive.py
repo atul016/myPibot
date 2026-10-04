@@ -21,6 +21,7 @@ import json
 import os
 import random
 import socket
+import subprocess
 import threading
 import time
 
@@ -29,7 +30,7 @@ import movement.bus  # noqa: F401 -- one lock around all I2C traffic (threads we
 
 import config as cfg  # noqa: E402
 from common import events as dash_events  # noqa: E402
-from common import faces, health, journal, persona as persona_mod, policy, sensors, state  # noqa: E402
+from common import faces, health, journal, persona as persona_mod, policy, react, sensors, state, surprise  # noqa: E402
 from common.bounded import run_bounded  # noqa: E402
 from common.motor_client import SOCK_PATH  # noqa: E402
 from common import speak_client as speak_client_mod  # noqa: E402
@@ -45,14 +46,6 @@ from picarx.preset_actions import ActionFlow, ActionStatus  # noqa: E402
 from robot_hat.device import get_battery_voltage  # noqa: E402 -- not robot_hat.utils' wrapper, which is deprecated
 
 COMPONENT = "openbot-alive"
-# Subset of STATIONARY_ACTIONS that reads as "idling," not "reacting to
-# something" -- the actual reflective/expressive autonomous behavior lives
-# in openbot-mind; this is just enough that the robot doesn't look frozen.
-# ("curious" was here -- not an action in picar-x 2.1.x, and ActionFlow
-# answers an unknown name by blocking its worker on an empty queue.)
-IDLE_GESTURES = ["think", "nod"]
-IDLE_INTERVAL_S = (15, 40)
-
 # Confirmed live: get_battery_voltage() reads ~8.2V on this pack. A 2S
 # Li-ion pack (2x 18650, the PiCar-X standard) runs ~8.4V full to ~6.0V at
 # cutoff -- a calibration knob, not a precise fuel gauge: real cells sag
@@ -77,6 +70,18 @@ class _SpeakerMusic:
 preset_actions.Music = _SpeakerMusic  # before ActionFlow() is constructed
 
 
+def _shut_down(pct: float) -> None:
+    """The battery is all but empty: say so, text its person (openbot-chat sends
+    session["text_out"]), and power off cleanly before it browns out."""
+    journal.log("did", f"battery at {pct:.0f}% -- shutting down before it dies")
+    dash_events.log_event("safety", f"battery at {pct:.0f}% -- shutting down")
+    state.update_session({"text_out": {"text": f"My battery is at {pct:.0f}% -- I'm shutting myself down now. "
+                                               "Please charge me!", "photo": False, "ts": time.time()}})
+    speak_client("Battery empty. Shutting down.")
+    time.sleep(15)  # time for the WhatsApp text to go out
+    subprocess.run(["sudo", "-n", "shutdown", "now"], check=False)
+
+
 def _battery_percent(voltage: float) -> float | None:
     """None well above "full" -- that's a charger/external supply (or an ADC
     glitch: 11.2V was seen on this 8.4V pack), not a fuller battery."""
@@ -94,16 +99,16 @@ NAVIGATING = threading.Event()
 NAV_CANCEL = threading.Event()
 
 
-def _start_navigation(car, monitor, task: dict) -> str:
+def _start_navigation(car, monitor, task: dict, action_flow) -> str:
     if NAVIGATING.is_set():
         return "already driving"
     NAV_CANCEL.clear()
     NAVIGATING.set()
-    threading.Thread(target=_navigate, args=(car, monitor, task), daemon=True).start()
+    threading.Thread(target=_navigate, args=(car, monitor, task, action_flow), daemon=True).start()
     return ""
 
 
-def _navigate(car, monitor, task: dict) -> None:
+def _navigate(car, monitor, task: dict, action_flow) -> None:
     from movement import navigate
     from movement.real_body import RealBody
 
@@ -120,17 +125,19 @@ def _navigate(car, monitor, task: dict) -> None:
         car.set_dir_servo_angle(0)
         body.look(0)
         NAVIGATING.clear()
-    if outcome.reason == "cancelled":
-        line = "Stopped."
-    elif target and outcome.done:
-        line = f"Made it to the {target}!"
-    elif outcome.seen:
-        line = f"{outcome.reason[0].upper()}{outcome.reason[1:]}. I saw: {', '.join(outcome.seen)}."
-    else:
-        line = f"{outcome.reason[0].upper()}{outcome.reason[1:]}."
+    what = f"drove {'to the ' + target if target else 'around exploring'}: {outcome.reason}"
     dash_events.log_event("safety", f"driving done: {outcome.reason} ({outcome.steps} steps)")
     print(f"drive: done -- {outcome.reason} ({outcome.steps} rounds)")
-    journal.log("did", f"drove {'to the ' + target if target else 'around exploring'}: {outcome.reason}")
+    journal.log("did", what)
+    # How it went is the LLM's to tell (in its mood); the facts come from the drive.
+    situation = (f"You just stopped driving because they said stop." if outcome.reason == "cancelled"
+                 else f"You just made it to the {target}!" if target and outcome.done
+                 else f"Your drive ended: {outcome.reason}." + (f" Along the way you saw: {', '.join(outcome.seen)}."
+                                                              if outcome.seen else ""))
+    line, tone = react.line(persona_mod.load(), situation + " Say how it went.",
+                            "Stopped." if outcome.reason == "cancelled" else outcome.reason.capitalize() + ".")
+    if tone:
+        action_flow.add_action(tone)
     speak_client(line)
 
 
@@ -158,7 +165,7 @@ def _action_server(action_flow: ActionFlow, car, monitor) -> None:
                 conn.sendall(json.dumps({"ok": True, "was_driving": NAVIGATING.is_set()}).encode())
                 continue
             if req.get("navigate"):
-                busy = _start_navigation(car, monitor, req["navigate"])
+                busy = _start_navigation(car, monitor, req["navigate"], action_flow)
                 conn.sendall(json.dumps({"ok": not busy, "error": busy}).encode())
                 continue
             actions = req.get("actions") or []
@@ -167,8 +174,10 @@ def _action_server(action_flow: ActionFlow, car, monitor) -> None:
                 continue  # a gesture mid-drive would fight the drive for the head and wheels
             wait = bool(req.get("wait", False))
             if actions:
-                if not any(a.startswith("look ") for a in actions):
-                    actions = [*actions, "look ahead"]  # gestures can end with the head turned; mind's camera expects "ahead"
+                if not any(a.startswith("look ") for a in actions) and not faces.read().get("faces"):
+                    # Re-centre for mind's "ahead" camera look -- unless someone's in view: the
+                    # face tracker takes the head straight back to them instead (no 0.4s detour).
+                    actions = [*actions, "look ahead"]
                 action_flow.add_action(*actions)
                 if wait:
                     run_bounded(action_flow.wait_actions_done, 8.0)
@@ -183,41 +192,52 @@ def _action_server(action_flow: ActionFlow, car, monitor) -> None:
 
 
 def main() -> None:
-    persona = persona_mod.load()
     health.start_watchdog(COMPONENT, cfg.WATCHDOG_STALE_SEC, cfg.WATCHDOG_PING_INTERVAL)
 
     car = Picarx()
     action_flow = ActionFlow(car)
     action_flow.start()
-    # Startup sound goes through the same quiet-hours gate as everything
-    # else audible -- a 3am restart (watchdog, power blip) shouldn't honk.
-    if policy.evaluate("audio", quiet_hours=(cfg.QUIET_HOURS_START, cfg.QUIET_HOURS_END)).allowed:
-        action_flow.add_action("start engine")
     car.set_cliff_reference(cfg.CLIFF_REFERENCE)
 
-    monitor = SafetyMonitor(car, action_flow, speak_client, cfg, persona)
+    monitor = SafetyMonitor(car, action_flow, cfg)
     monitor.start_distance_watchdog()
 
     threading.Thread(target=_action_server, args=(action_flow, car, monitor), daemon=True).start()
     threading.Thread(target=_face_tracker, args=(car, action_flow), daemon=True).start()
 
     health.record_success(COMPONENT)
-    next_idle_at = time.time() + random.uniform(*IDLE_INTERVAL_S)
     next_sensor_publish = 0.0
+    last_latches: dict = {}
     next_sleep_check, asleep = 0.0, False
     next_battery_poll = 0.0
     battery_v: float | None = None
     battery_pct: float | None = None
+    battery_low_readings, shutdown_tried = 0, False
 
     try:
         while True:
+            if time.time() >= next_battery_poll and not NAVIGATING.is_set():
+                # Read even asleep: it sleeps all night, which is when the battery runs out.
+                try:
+                    battery_v = get_battery_voltage()
+                    battery_pct = _battery_percent(battery_v)
+                    battery_low_readings = surprise.battery_critical(battery_low_readings, battery_v, battery_pct)
+                except Exception as e:  # a failed read is no reading -- never a low one
+                    print(f"battery read failed: {e}")
+                next_battery_poll = time.time() + BATTERY_POLL_INTERVAL_S
+                if battery_low_readings:
+                    print(f"battery low: {battery_pct:.0f}% ({battery_v:.2f}V), reading "
+                          f"{battery_low_readings}/{surprise.SHUTDOWN_READINGS} before shutting down")
+                if battery_low_readings >= surprise.SHUTDOWN_READINGS and not shutdown_tried:
+                    shutdown_tried = True  # once: if sudo is refused, don't say goodbye every 90s
+                    _shut_down(battery_pct)
             if time.time() >= next_sleep_check:
                 asleep = bool(state.load_session().get("asleep"))
                 monitor.paused = asleep
                 next_sleep_check = time.time() + 1.0
             if asleep:
-                # "Go to sleep": no sensors, no cliff/proximity reflexes, no fidgets, no
-                # battery reads -- only the action socket stays up (to wake the head).
+                # "Go to sleep": no sensors, no cliff/proximity reflexes, no fidgets -- only the
+                # battery check (above) and the action socket (to wake the head) stay up.
                 # Still healthy, though: asleep on purpose, not hung.
                 health.record_success(COMPONENT, min_interval_s=5.0)
                 time.sleep(0.5)
@@ -225,35 +245,21 @@ def main() -> None:
             if NAVIGATING.is_set():
                 # The drive guards itself; reflexes (a bullfight push!) and fidgets would fight it.
                 if time.time() >= next_sensor_publish:
-                    sensors.publish(**monitor.snapshot(), battery_v=battery_v, battery_pct=battery_pct)
+                    sensors.publish(**monitor.snapshot(), battery_v=battery_v, battery_pct=battery_pct, driving=True,
+                                    head=dict(HEAD))
                     next_sensor_publish = time.time() + 1.0
                 health.record_success(COMPONENT, min_interval_s=5.0)
                 time.sleep(0.05)
                 continue
             monitor.poll()
-            if time.time() >= next_idle_at:
-                # Never drift mid-conversation: the gesture's own servo
-                # noise gets picked up by the mic while wake_listen.py is
-                # recording the next turn, and can read as silence/
-                # hallucinated garbage -- which wake_listen.py treats as
-                # "end the session." Same "don't act while someone's
-                # talking to you" rule openbot-mind's reflection already
-                # follows, just missing here originally.
-                quiet_verdict = policy.evaluate("presence", quiet_hours=(cfg.QUIET_HOURS_START, cfg.QUIET_HOURS_END))
-                # ...and not while looking at someone: a fidget would look away from them.
-                if quiet_verdict.allowed and not state.conversation_active() and not faces.read().get("faces"):
-                    _idle_drift(action_flow)
-                next_idle_at = time.time() + random.uniform(*IDLE_INTERVAL_S)
-            if time.time() >= next_battery_poll:
-                # Slow-changing; nowhere near the main loop's ~10ms cadence.
-                try:
-                    battery_v = get_battery_voltage()
-                    battery_pct = _battery_percent(battery_v)
-                except Exception as e:
-                    print(f"battery read failed: {e}")
-                next_battery_poll = time.time() + BATTERY_POLL_INTERVAL_S
+            if monitor.snapshot()["latches"] != last_latches:  # a hand just arrived: publish NOW, not at the next tick
+                last_latches = monitor.snapshot()["latches"]
+                next_sensor_publish = 0.0
+            if HEAD_MOVED.is_set():  # the head just started moving: say so before the motion reading does
+                HEAD_MOVED.clear()
+                next_sensor_publish = 0.0
             if time.time() >= next_sensor_publish:
-                sensors.publish(**monitor.snapshot(), battery_v=battery_v, battery_pct=battery_pct)
+                sensors.publish(**monitor.snapshot(), battery_v=battery_v, battery_pct=battery_pct, head=dict(HEAD))
                 next_sensor_publish = time.time() + 1.0
             time.sleep(0.01)
     finally:
@@ -261,26 +267,48 @@ def main() -> None:
         car.stop()
 
 
+# Where the head points (by the tracker's own writes) and when it last moved -- published with the
+# sensors, so the mind knows a different view is its own glance. A move starting after stillness
+# is published at once: the camera's motion reading would otherwise beat the next 1s publish.
+HEAD = {"pan": 0.0, "tilt": 0.0, "moved_ts": 0.0}
+HEAD_MOVED = threading.Event()
+
 TRACK_INTERVAL_S = 0.2   # matches openbot-camera's face-check rate
 FACE_LOST_HOLD_S = 3.0   # keep looking where you were this long before drifting back to centre
+WANDER_DEG = (8.0, 5.0)  # idle gaze: small random glances around centre (pan, tilt) -- not a frozen stare
+WANDER_EVERY_S = (3.0, 8.0)
+EASE_DEG = faces.MAX_STEP_DEG  # per tick, toward wherever the head is heading -- same pace as following a face
+
+
+def _ease(cur: float, target: float) -> float:
+    return cur + max(-EASE_DEG, min(EASE_DEG, target - cur))
 
 
 def _face_tracker(car: Picarx, action_flow: ActionFlow) -> None:
     """Turns the head toward the biggest face openbot-camera sees -- the
     single most "alive" thing a robot can do. Only between gestures (a
-    gesture owns the head, and ends re-centred by "look ahead") and never in
-    quiet hours (servo whine)."""
-    pan = tilt = 0.0
-    last_seen = allowed_checked = 0.0
-    allowed = False
+    gesture owns the head; every preset starts with car.reset() and ends
+    centred) and never while asleep. After a gesture the
+    gaze goes back to the person, not to centre; with nobody around the
+    head glances about a little instead of staring straight ahead."""
+    pan = tilt = 0.0            # where the head is (by our own writes)
+    target = (0.0, 0.0)         # where it's heading when no face steers it
+    last_seen = allowed_checked = next_wander = 0.0
+    allowed, talking = False, False
     while True:
         time.sleep(TRACK_INTERVAL_S)
         now = time.time()
         if action_flow.status != ActionStatus.STANDBY or NAVIGATING.is_set():
-            pan = tilt = 0.0  # the gesture (or drive) finishes with the head centred
+            # The gesture (or drive) finishes with the head centred. Remember where the
+            # person was, so the gaze returns to them as soon as the head is free.
+            if pan or tilt:
+                target = (pan, tilt) if now - last_seen < FACE_LOST_HOLD_S else (0.0, 0.0)
+            pan = tilt = 0.0
+            HEAD.update(pan=0.0, tilt=0.0, moved_ts=now)  # the gesture or drive is moving the head
             continue
         if now - allowed_checked > 5.0:  # policy reads the session file -- not at 5Hz
-            allowed = policy.evaluate("presence", quiet_hours=(cfg.QUIET_HOURS_START, cfg.QUIET_HOURS_END)).allowed
+            allowed = policy.evaluate("presence").allowed
+            talking = state.conversation_active()
             allowed_checked = now
         if not allowed:
             continue
@@ -289,25 +317,25 @@ def _face_tracker(car: Picarx, action_flow: ActionFlow) -> None:
         if seen:
             last_seen = now
             nxt = faces.head_step(seen[0]["box"], (data["w"], data["h"]), pan, tilt)
-        elif (pan or tilt) and now - last_seen > FACE_LOST_HOLD_S:
-            nxt = (pan - max(-5.0, min(5.0, pan)), tilt - max(-5.0, min(5.0, tilt)))  # ease back to centre
-        else:
-            nxt = None
-        if nxt:
+            if nxt:
+                target = nxt
+        elif now - last_seen > FACE_LOST_HOLD_S:
+            if target != (0.0, 0.0) and now - last_seen < 2 * FACE_LOST_HOLD_S:
+                target = (0.0, 0.0)  # they left: drift back to centre first
+            elif now >= next_wander and not talking:  # servo noise mid-recording reads as garbage
+                target = (random.uniform(-WANDER_DEG[0], WANDER_DEG[0]), random.uniform(-WANDER_DEG[1], WANDER_DEG[1]))
+                next_wander = now + random.uniform(*WANDER_EVERY_S)
+        nxt = (_ease(pan, target[0]), _ease(tilt, target[1]))
+        if nxt != (pan, tilt):
             pan, tilt = nxt
+            if now - HEAD["moved_ts"] > 1.0:
+                HEAD_MOVED.set()
+            HEAD.update(pan=pan, tilt=tilt, moved_ts=now)
             try:
                 car.set_cam_pan_angle(pan)
                 car.set_cam_tilt_angle(tilt)
             except Exception as e:
                 print(f"face tracker: servo write failed: {e}")
-
-
-def _idle_drift(action_flow: ActionFlow) -> None:
-    # Re-center after: "think" leaves the head turned, and mind's periodic
-    # "ahead" camera look would read the shifted view as a scene change.
-    action_flow.add_action(random.choice(IDLE_GESTURES), "look ahead")
-    state.mark_self_noise()
-    dash_events.log_event("safety", "idle drift")
 
 
 if __name__ == "__main__":

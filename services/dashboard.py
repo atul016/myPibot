@@ -15,11 +15,12 @@ from pathlib import Path
 from flask import Flask, Response, send_file
 
 from common import events as dash_events
-from common import agenda, faces, health, journal, memory, sensors, state, vision
+from common import agenda, faces, health, jev, journal, memory, sensors, state, stats, vision
 from dashboard.page import PAGE
 
 PORT = int(os.environ.get("OPENBOT_DASHBOARD_PORT", "8080"))
-HEALTH_COMPONENTS = ["openbot-alive"] * (os.environ.get("OPENBOT_BODY", "none") != "none") + ["openbot-wake-listen", "openbot-mind", "openbot-speak", "openbot-camera"]
+HEALTH_COMPONENTS = ["openbot-alive"] * (os.environ.get("OPENBOT_BODY", "none") != "none") + ["openbot-wake-listen", "openbot-mind", "openbot-speak", "openbot-camera"] \
+    + ["openbot-chat"] * bool(os.environ.get("OPENBOT_CHAT_ALLOW"))
 STATE_ROOT = state.STATE_DIR.resolve()
 
 app = Flask(__name__)
@@ -80,6 +81,36 @@ def api_mind():
         "reactions": reactions,
         "journal": journal.tail(60),
     }), mimetype="application/json")
+
+
+@app.route("/api/dreams")
+def api_dreams():
+    """The Dreams & wishes tab: each night's dream note (what it kept from the
+    day), its wishes (self/wishes.md), and the rules it wrote itself about
+    what works with people (self/what-works.md)."""
+    dreams = []
+    for path in sorted((memory.MIND_DIR / "dreams").glob("*.md"), reverse=True)[:7]:
+        body = path.read_text(encoding="utf-8", errors="replace").split("---\n", 2)[-1].strip()
+        dreams.append({"night": path.stem, "text": body})
+    strip = lambda lines: [ln.split("] ", 1)[-1] for ln in lines]
+    return Response(json.dumps({
+        "dreams": dreams,
+        "wishes": strip(memory.read_note("self", "wishes"))[::-1],
+        "rules": strip(memory.read_note("self", "what works")),
+    }), mimetype="application/json")
+
+
+@app.route("/api/stats")
+def api_stats():
+    """The Stats tab: per day for the last week, newest first (common/stats.py)."""
+    return Response(json.dumps(stats.week(7)), mimetype="application/json")
+
+
+@app.route("/api/jev")
+def api_jev():
+    """The Jev tab: every question asked of Jev (common/jev.py) -- the whole
+    request but the key -- and Jev's whole answer, newest first."""
+    return Response(json.dumps(jev.recent_calls(50)), mimetype="application/json")
 
 
 @app.route("/api/vision")

@@ -30,6 +30,8 @@ DEFAULT_SESSION: dict[str, Any] = {
     "mood": "neutral",
     "confirm_motion_allowed": True,
     "asleep": False,  # "go to sleep": camera off, no thinking, no moving -- the wake word wakes it
+    "remote_command": None,  # commands.SLASH texted on WhatsApp, for wake-listen to carry out
+    "text_out": None,  # a WhatsApp text the mind decided on, for openbot-chat to send
 }
 
 # A session stays open until "stop session" -- but the mind shouldn't stay

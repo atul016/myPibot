@@ -18,25 +18,32 @@ MAX_EVENTS = 200
 def log_event(kind: str, text: str) -> None:
     """kind: "heard"/"reply"/"safety"/"wake"/"mic" -- descriptive only,
     used by the dashboard to color-code log rows."""
-    EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps({"ts": time.time(), "kind": kind, "text": text})
-    with EVENTS_PATH.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
-    _trim_if_needed()
-
-
-def _trim_if_needed() -> None:
-    try:
-        lines = EVENTS_PATH.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return
-    if len(lines) > MAX_EVENTS * 2:  # trim in batches, not every write
-        atomic_write(EVENTS_PATH, "\n".join(lines[-MAX_EVENTS:]) + "\n")
+    append_jsonl(EVENTS_PATH, {"ts": time.time(), "kind": kind, "text": text}, MAX_EVENTS)
 
 
 def recent_events(limit: int = MAX_EVENTS) -> list[dict]:
+    return read_jsonl(EVENTS_PATH, limit)
+
+
+def append_jsonl(path: Path, record: dict, keep: int | None = None) -> None:
+    """One JSON line onto `path`; with `keep`, trimmed to the last `keep` lines
+    now and then. Also the Jev call log (common/jev.py), which keeps everything."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+    if keep is None:
+        return
     try:
-        lines = EVENTS_PATH.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    if len(lines) > keep * 2:  # trim in batches, not every write
+        atomic_write(path, "\n".join(lines[-keep:]) + "\n")
+
+
+def read_jsonl(path: Path, limit: int) -> list[dict]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return []
     out = []

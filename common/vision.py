@@ -17,7 +17,7 @@ import subprocess
 import time
 from typing import Any
 
-from . import cognition
+from . import cognition, sensors
 from .state import STATE_DIR, atomic_write
 
 VISION_PATH = STATE_DIR / "vision.json"
@@ -35,6 +35,14 @@ TUNING_FILE = os.environ.get("OPENBOT_CAMERA_TUNING", "/usr/share/libcamera/ipa/
 # scene changes all night. Calibration knob for this camera/room.
 DARK_BRIGHTNESS = 40  # measured: pitch-dark room reads ~25 at max auto-gain
 DARK_SCENE = "It's too dark to see anything."
+# A look is compared only with the last one from about the same ROOM direction (where the body faces
+# + where the head points), in steps this wide: the head follows faces (up to 60 deg) and glances
+# about (+-8), so "ahead" was often a different view -- "the room layout shifted again without me
+# moving" came up 55 times in one day.
+VIEW_STEP_DEG = 20
+# Moved (picked up, driven): it doesn't know which way its body faces until a look matches a view in
+# its map; after this many looks that match nothing, it's somewhere new -- a fresh map.
+BEARING_TRIES = 3
 
 _SCHEMA = {
     "type": "object",
@@ -84,20 +92,88 @@ def last_look() -> dict[str, Any]:
         return {}
 
 
-def look(base_url: str, model: str, direction: str = "ahead") -> dict[str, Any] | None:
-    """Capture + describe. Returns {scene, changed, kind, what_changed, direction, ts}
-    or None if the camera or the LLM failed. `changed` compares against the
-    last look in the SAME direction -- a head turn isn't a scene change."""
+def view_key(pan: float, tilt: float) -> str:
+    return f"{round(pan / VIEW_STEP_DEG) * VIEW_STEP_DEG:+d},{round(tilt / VIEW_STEP_DEG) * VIEW_STEP_DEG:+d}"
+
+
+def head_words(pan: float, tilt: float) -> str:
+    """"head turned 30 deg to your right" -- pan + = right, tilt + = up."""
+    parts = ([f"{abs(pan):.0f} degrees to your {'right' if pan > 0 else 'left'}"] if abs(pan) >= 5 else []) + \
+            ([f"{abs(tilt):.0f} degrees {'up' if tilt > 0 else 'down'}"] if abs(tilt) >= 5 else [])
+    return "head turned " + " and ".join(parts) if parts else "head pointing straight ahead"
+
+
+def lost_bearings() -> None:
+    """Picked up, set down, or it drove: it no longer knows which way its body
+    faces. The map of views stays -- the next looks try to recognize one."""
+    record = last_look()
+    if not record.get("lost"):
+        atomic_write(VISION_PATH, json.dumps({**record, "lost": {"since": time.time(), "tries": 0}}))
+
+
+def facing_words() -> str:
+    """Which way the body faces, for the mind's prompt."""
+    record = last_look()
+    if record.get("lost"):
+        return "not sure -- you were moved and haven't recognized anything around you yet"
+    h = record.get("heading", 0.0)
+    return ("the way you faced when you first mapped this room" if abs(h) < 10 else
+            f"turned {abs(h):.0f} degrees to the {'right' if h > 0 else 'left'} of how you faced when you first "
+            "mapped this room")
+
+
+def _find_bearings(base_url: str, model: str, scene: str, head: tuple[float, float],
+                   views: dict[str, str]) -> float | None:
+    """The body's heading, if `scene` (seen with the head at `head`) is one of the
+    views in the map -- the LLM matches them by what's in them. None: no match."""
+    options = {k: v for k, v in views.items() if v and v != DARK_SCENE}
+    if not options:
+        return None
+    listing = "\n".join(f"- {k}: {v}" for k, v in options.items())
+    result = cognition.ask(
+        base_url, model,
+        "You are a small robot. Someone just moved you, so you don't know which way you're facing. Earlier you "
+        f"saw these views (label: what you saw):\n{listing}\n\nNow you see: \"{scene}\". Is this the same view as "
+        "one of them -- the same things, the same part of the room? Answer with its label, or \"none\" if it "
+        "doesn't clearly match one.",
+        json_schema={"type": "object", "properties": {"same_as": {"type": "string", "enum": [*options, "none"]}},
+                     "required": ["same_as"]},
+        timeout_s=30.0, num_predict=40)
+    if result.status != cognition.AVAILABLE:
+        return None
+    try:
+        same = json.loads(result.text).get("same_as")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    if same not in options:
+        return None
+    return (float(same.split(",")[0]) - head[0] + 180) % 360 - 180
+
+def look(base_url: str, model: str, direction: str = "ahead",
+         head: tuple[float, float] | None = None) -> dict[str, Any] | None:
+    """Capture + describe. Returns {scene, changed, kind, what_changed, direction, head, ts}
+    or None if the camera or the LLM failed. `changed` compares against the last
+    look from about the same head angle (`head`: (pan, tilt); default: where
+    openbot-alive says the head is) -- a head turn isn't a scene change."""
     jpeg = capture()
     if jpeg is None:
         return None
-    prev = last_look().get("by_direction", {}).get(direction, "")
+    if head is None:
+        h = sensors.read().get("head") or {}
+        head = (h.get("pan", 0.0), h.get("tilt", 0.0))
+    record = last_look()
+    heading, lost = record.get("heading", 0.0), record.get("lost")
+    prev = "" if lost else record.get("views", {}).get(view_key(heading + head[0], head[1]), "")
     if brightness(jpeg) < DARK_BRIGHTNESS:
         changed = bool(prev) and prev != DARK_SCENE
         return _save({"scene": DARK_SCENE, "changed": changed, "kind": "lights_off",
-                      "what_changed": "the lights went out" if changed else "", "direction": direction})
+                      "what_changed": "the lights went out" if changed else "", "direction": direction, "head": head},
+                     heading, lost)
+    from . import objects  # deferred: objects -> faces is heavier than this module needs at import
+    detected = objects.names(objects.read())
     prompt = ("You are a small desk robot looking through your camera "
-              f"(head turned {direction}). Describe what you see in one short, concrete sentence. "
+              f"({head_words(*head)}). Describe what you see in one short, concrete sentence. "
+              + (f"Your object detector sees {detected} -- trust it over guesses. " if detected else "") +
               "Your camera has no infrared filter, so black or dark things (clothes, hair, shadows) "
               "show up purple or magenta -- treat that tint as dark, don't call things purple because of it. "
               + (f"Last time you looked this way you saw: \"{prev}\". Say whether anything meaningful "
@@ -113,9 +189,28 @@ def look(base_url: str, model: str, direction: str = "ahead") -> dict[str, Any] 
         return None
     if prev == DARK_SCENE:  # the model can't compare against a frame it never saw
         return _save({"scene": str(data.get("scene", "")), "changed": True, "kind": "lights_on",
-                      "what_changed": "the lights came on", "direction": direction})
-    return _save({"scene": str(data.get("scene", "")), "changed": bool(data.get("changed")) and bool(prev),
-                  "kind": "scene", "what_changed": str(data.get("what_changed", "")), "direction": direction})
+                      "what_changed": "the lights came on", "direction": direction, "head": head}, heading, lost)
+    out = {"scene": str(data.get("scene", "")), "changed": bool(data.get("changed")) and bool(prev),
+           "kind": "scene", "what_changed": str(data.get("what_changed", "")), "direction": direction, "head": head}
+    if lost:
+        found = _find_bearings(base_url, model, out["scene"], head, record.get("views", {}))
+        if found is not None:
+            heading, lost = found, None
+            out["bearings"] = (f"you recognize this view: you're now facing {facing_words_for(heading)} -- "
+                               "you were turned, the room didn't change")
+        elif lost["tries"] + 1 >= BEARING_TRIES:
+            heading, lost = 0.0, None
+            record["views"] = {}
+            atomic_write(VISION_PATH, json.dumps(record))
+            out["bearings"] = "you don't recognize any of this -- somewhere new, so you start a fresh map of it"
+        else:
+            lost = {**lost, "tries": lost["tries"] + 1}
+    return _save(out, heading, lost)
+
+
+def facing_words_for(heading: float) -> str:
+    return ("the way you faced when you first mapped this room" if abs(heading) < 10 else
+            f"{abs(heading):.0f} degrees to the {'right' if heading > 0 else 'left'} of how you faced at first")
 
 
 _EXTENT = {"type": "object", "properties": {"visible": {"type": "boolean"}, "left": {"type": "number"},
@@ -159,13 +254,19 @@ def list_objects(base_url: str, model: str, jpeg: bytes) -> list[str]:
         return []
 
 
-def _save(out: dict[str, Any]) -> dict[str, Any]:
+def _save(out: dict[str, Any], heading: float = 0.0, lost: dict | None = None) -> dict[str, Any]:
+    """by_direction: the last scene per named look (the dashboard's Camera tab);
+    views: the map -- per room direction (heading + head pan), what the next look
+    that way is compared with; not added to while lost (which way is unknown)."""
     out["ts"] = time.time()
-    direction = out["direction"]
     record = last_look()
-    by_direction = record.get("by_direction", {})
-    by_direction[direction] = out["scene"]
-    atomic_write(VISION_PATH, json.dumps({**out, "by_direction": by_direction}))
+    by_direction = {**record.get("by_direction", {}), out["direction"]: out["scene"]}
+    views = record.get("views", {})
+    if not lost:
+        pan, tilt = out.get("head", (0, 0))
+        views = {**views, view_key(heading + pan, tilt): out["scene"]}
+    atomic_write(VISION_PATH, json.dumps({**out, "by_direction": by_direction, "views": views,
+                                          "heading": heading, "lost": lost}))
     return out
 
 
@@ -182,6 +283,24 @@ def demo() -> None:
             assert look("http://192.0.2.1:1/v1", "m") is None
         first = _save({"scene": DARK_SCENE, "changed": False, "what_changed": "", "direction": "ahead"})
         assert last_look()["by_direction"] == {"ahead": DARK_SCENE} and first["ts"]
+        # a glance (+-8 deg) is the same view; following a face 30 deg right, or "look left", is not
+        assert view_key(0, 0) == view_key(8, -5) == "+0,+0" and view_key(30, 0) != view_key(0, 0) != view_key(-45, 0)
+        _save({"scene": "a desk", "changed": False, "what_changed": "", "direction": "ahead", "head": (30, 0)})
+        assert last_look()["views"][view_key(30, 0)] == "a desk" and facing_words().startswith("the way you faced")
+        lost_bearings()  # picked up and turned: which way it faces is unknown -- but the map stays
+        assert last_look()["lost"] and last_look()["views"]["+40,+0"] == "a desk" and facing_words().startswith("not sure")
+        real_ask = cognition.ask
+        try:  # the bed it used to see 40 deg to its left is now straight ahead: turned 40 deg left
+            cognition.ask = lambda *a, **k: cognition.CognitionResult(cognition.AVAILABLE, '{"same_as": "-40,+0"}')
+            assert _find_bearings("u", "m", "a messy bed", (0, 0), {"-40,+0": "a messy bed", "+40,+0": "a desk"}) == -40
+            cognition.ask = lambda *a, **k: cognition.CognitionResult(cognition.AVAILABLE, '{"same_as": "none"}')
+            assert _find_bearings("u", "m", "a kitchen", (0, 0), {"-40,+0": "a messy bed"}) is None
+        finally:
+            cognition.ask = real_ask
+        assert facing_words_for(-40) == "40 degrees to the left of how you faced at first"
+        assert head_words(0, 3) == "head pointing straight ahead"
+        assert head_words(-45, 0) == "head turned 45 degrees to your left"
+        assert head_words(30, 10) == "head turned 30 degrees to your right and 10 degrees up"
         try:
             import io
             from PIL import Image
