@@ -43,8 +43,12 @@ class ArecordStream:
     16-bit/mono), far less than one STT+LLM round takes.
     """
 
-    def __init__(self, device: str, rate: int = 44100, channels: int = 1, chunk_frames: int = 2048):
+    def __init__(self, device: str, rate: int = 44100, channels: int = 1, chunk_frames: int = 2048,
+                 cmd: list[str] | None = None):
         self.device = device
+        # Any command that writes raw 16-bit PCM to stdout instead of arecord --
+        # openbot-wake-listen reads openbot-ears' live audio this way (common/hearing.py).
+        self.cmd = cmd
         self.rate = rate
         self.channels = channels
         self.chunk_bytes = chunk_frames * 2 * channels
@@ -54,8 +58,8 @@ class ArecordStream:
 
     def start_stream(self) -> None:
         self._proc = subprocess.Popen(
-            ["arecord", "-D", self.device, "-f", "S16_LE", "-r", str(self.rate),
-             "-c", str(self.channels), "-t", "raw"],
+            self.cmd or ["arecord", "-D", self.device, "-f", "S16_LE", "-r", str(self.rate),
+                         "-c", str(self.channels), "-t", "raw"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
 

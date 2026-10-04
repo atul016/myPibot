@@ -57,12 +57,15 @@ DEFAULT_NUM_PREDICT = 400
 def ask(base_url: str, model: str, prompt: str, *, system: str | None = None,
         json_schema: dict | None = None, timeout_s: float = 60.0,
         num_predict: int = DEFAULT_NUM_PREDICT, image_jpeg: bytes | None = None,
-        history: list[dict] | None = None) -> CognitionResult:
+        history: list[dict] | None = None, temperature: float | None = None) -> CognitionResult:
     """history: prior {"role", "content"} chat turns, placed between the
     system prompt and this prompt -- system + history first keeps the
     server's prefix cache warm across a conversation. image_jpeg: one
-    camera frame, sent as an OpenAI-style data URI."""
+    camera frame, sent as an OpenAI-style data URI. temperature: None = the
+    server's own; low for a decision that should come out the same each time."""
     payload = _payload(model, prompt, system, json_schema, num_predict, image_jpeg, history)
+    if temperature is not None:
+        payload["temperature"] = temperature
     url = _known(base_url)
     try:
         resp = _post(url, payload, timeout_s)

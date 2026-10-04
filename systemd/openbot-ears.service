@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenBot ears (sole microphone owner: live audio + what it hears, on 127.0.0.1:9001)
+After=sound.target
+# Never give up restarting it: a mic still held for a moment (the old process's arecord) fails a
+# start or two, and systemd's default (5 in 10s) would leave the robot deaf for good.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=/etc/openbot/openbot.env
+ExecStart=/usr/bin/python3 -u -m services.ears
+Restart=always
+# Everything that hears depends on this one: back fast (wake-listen reconnects by itself).
+RestartSec=2
+NotifyAccess=main
+# No audio for this long -> health goes stale -> pings stop -> systemd restarts it.
+WatchdogSec=60
+
+[Install]
+WantedBy=multi-user.target

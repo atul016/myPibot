@@ -41,14 +41,15 @@ from typing import Any, Callable
 
 import config as cfg  # noqa: E402
 from common import agenda, cognition, contacts, decider, events as dash_events, faces, health, journal, memory  # noqa: E402
-from common import objects, outcomes, sounds, tools  # noqa: E402
+from common import hearing, objects, outcomes, tools  # noqa: E402
 from common import persona as persona_mod, policy, react, sensors, state, surprise, vision  # noqa: E402
 from common.motor_client import dispatch as motor_dispatch  # noqa: E402
 from common.speak_client import speak as speak_client  # noqa: E402
 
 COMPONENT = "openbot-mind"
 # openbot-memory isn't listed: it's Basic Memory itself, which doesn't write our health records.
-HEALTH_COMPONENTS = ["openbot-alive"] * cfg.HAS_BODY + ["openbot-wake-listen", "openbot-mind", "openbot-speak"]
+HEALTH_COMPONENTS = ["openbot-alive"] * cfg.HAS_BODY + ["openbot-ears", "openbot-wake-listen", "openbot-mind",
+                                                        "openbot-speak"]
 
 ALLOWED_EXPRESSIONS = {"speak", "gesture", "wait", "remember", "play_sound", "time_check", "introspect",
                        "remind_me", "watch", "rest", "wish", "sleep", "go_to", "explore"}
@@ -223,7 +224,7 @@ def _needs() -> list[str]:
     if pct is not None and pct < 20:
         needs.append(f"tired: battery at {pct:.0f}% -- you'd like to be charged; rest more, move less")
     look = vision.last_look()
-    if look.get("scene") == vision.DARK_SCENE and max(sensors.read_hearing()[-5:] or [0]) < 600:
+    if look.get("scene") == vision.DARK_SCENE and max((hearing.read() or {}).get("levels", [])[-5:] or [0]) < 600:
         needs.append("dark and quiet: a good time to sleep (the `sleep` action) -- unless something is going on")
     unhealthy = [k for k, v in health.all_status(HEALTH_COMPONENTS).items() if v not in ("ok", "degraded")]
     if "openbot-camera" in unhealthy:
@@ -613,12 +614,13 @@ def _run_tool(name: str, params: dict) -> str:
         return f"look {direction}: {seen['scene']}{change}{note}{found}"
     if name == "listen":
         time.sleep(LISTEN_S)
-        levels = sensors.read_hearing()
-        if not levels:
-            return "listen: your ears aren't working right now"
-        recent, room = levels[-int(LISTEN_S):], sorted(levels)[len(levels) // 2]
-        return (f"listen: loudness over the last {LISTEN_S:.0f}s {recent} (typical for this room ~{room}; "
-                "quiet ~300, talking ~1000+, a bang 3000+)")
+        heard = hearing.read()
+        if heard is None or not heard["levels"]:
+            return "listen: your hearing service (openbot-ears) isn't answering right now -- that's not silence"
+        n, levels = int(LISTEN_S), heard["levels"]
+        recent, room = levels[-n:], sorted(levels)[len(levels) // 2]
+        return (f"listen: {hearing.describe(heard['sounds'][-n:])}; loudness over the last {n}s {recent} "
+                f"(typical for this room ~{room}; quiet ~300, talking ~1000+, a bang 3000+)")
     if name == "recall":
         found = memory.recall(params["query"])
         if found is None:
@@ -735,6 +737,8 @@ def _consider_texting(persona, events: list[Event], steps: list[str], mood_befor
         s = state.load_session()
         if time.time() - s.get("last_text_ts", 0) < TEXT_FLOOR_S:
             return
+        if all(state.texting_paused(n, s) for n in cfg.CHAT_ALLOW):
+            return  # they asked for a break from its texts (skills/pause_texting): don't even ask
         happened = [t for _, t in events] or "nothing new -- an idle moment"
         to = contacts.names(cfg.CHAT_ALLOW)  # linked like faces: "My name is Atul" texted once
         seen, _ = faces.visible_names(faces.read())
@@ -950,14 +954,16 @@ def _make_sensor() -> Callable[[], list[Event]]:
                 last_motion[0] = time.time()
                 events += moving
         if not _recently_self_noisy():
-            levels = sensors.read_hearing()
+            heard = hearing.read() or {"levels": [], "sounds": []}
+            levels = heard["levels"]
             for kind, text in surprise.loudness_events(levels):
                 peak = max(levels[-2:])
                 if time.time() - last_sound[0] < cfg.SOUND_COOLDOWN_S and peak < 2 * last_sound[1]:
                     continue  # another tap like the last one -- not news
                 last_sound[:] = [time.time(), peak]
-                name = sounds.read()  # openbot-wake-listen names it the moment the room gets loud
-                events.append((kind, f"{text} -- it sounded like: {name}" if name else text))
+                name = heard["sounds"][len(levels) - 2 + levels[-2:].index(peak)]  # openbot-ears named that second
+                events.append((kind, f"{text} -- it sounded like: {name}" if name and name != hearing.OWN_VOICE
+                               else text))
         return events
 
     return sense

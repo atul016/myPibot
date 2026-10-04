@@ -26,7 +26,6 @@ import json
 import os
 import queue
 import re
-import struct
 import threading
 import time
 from collections import deque
@@ -37,7 +36,7 @@ import common.system  # noqa: F401 -- side effect, harmless even though this pro
 import config as cfg  # noqa: E402
 from common import cognition, events as dash_events, health, mic_stream, persona as persona_mod  # noqa: E402
 from common import commands, faces, journal, memory, react, reply_schema, sensors, speak_client as speak_mod, state, vision  # noqa: E402
-from common import sounds, surprise, voices  # noqa: E402
+from common import hearing, voices  # noqa: E402
 from common.motor_client import dispatch as motor_dispatch  # noqa: E402
 from common.speak_client import speak as speak_client  # noqa: E402
 from common import stt  # noqa: E402
@@ -83,7 +82,6 @@ def _wake_up_phrases(name: str) -> list[str]:
 _offered_move: str | None = None  # a wheel move the last reply offered ("want a fist bump?") -- "yes" does it
 _whisper: "stt.Whisper | stt.RemoteWhisper | None" = None  # set in the background at startup; None until then
 _wake_model = None  # set in main(); also used for the barge-in recognizer
-_sounds: "sounds.Classifier | None" = None  # loaded in the background at startup; optional (no model, no names)
 _voices: "voices.VoiceEngine | None" = None
 _voice_speaker: str | None = None  # this turn's speaker, known only by voice (no face said who)
 
@@ -95,13 +93,6 @@ def _vosk_model_path() -> str:
         else "vosk-model-small-en-us-0.15"
     return os.path.expanduser(f"~/.vosk_models/{name}")
 
-
-def _rms(chunk: bytes) -> float:
-    count = len(chunk) // 2
-    if count == 0:
-        return 0.0
-    shorts = struct.unpack(f"{count}h", chunk)
-    return (sum(s * s for s in shorts) / count) ** 0.5
 
 
 def _started(heard: str) -> bool:
@@ -507,9 +498,9 @@ REMOTE_FRESH_S = 60.0  # a texted command older than this (wake-listen was down)
 
 
 def _do_remote(persona, mic: mic_stream.ArecordStream, in_session: bool) -> bool:
-    """A mode command texted on WhatsApp (commands.SLASH, via services/chat.py),
-    carried out as if it had just been said. Returns whether the conversation
-    (if any) goes on."""
+    """A mode skill used by text on WhatsApp (skills sleep, wake_up,
+    end_conversation, volume -- session["remote_command"]), carried out as if
+    it had just been said. Returns whether the conversation (if any) goes on."""
     s = state.load_session()
     cmd = s.get("remote_command")
     if not cmd:
@@ -520,7 +511,8 @@ def _do_remote(persona, mic: mic_stream.ArecordStream, in_session: bool) -> bool
     dash_events.log_event("wake", f"texted command: {cmd}")
     if cmd == commands.WAKE and s.get("asleep"):
         _wake_up(persona, mic)
-    elif (cmd == commands.SLEEP and not s.get("asleep")) or (cmd == commands.STOP_SESSION and in_session):
+    elif (cmd == commands.SLEEP and not s.get("asleep")) or (cmd == commands.STOP_SESSION and in_session) \
+            or cmd in (commands.LOUDER, commands.SOFTER):
         return _do_command(persona, cmd, mic)
     return True
 
@@ -819,25 +811,10 @@ def _wake_name(persona) -> str:
     return persona.name.lower().split()[-1]
 
 
-def _label_sound(recent: deque) -> None:
-    """The last second of audio, the moment the room got loud -> what it was (common/sounds.py)."""
-    audio = b""
-    for _, chunk in reversed(recent):
-        audio = chunk + audio
-        if len(audio) >= MIC_RATE * 2:
-            break
-    top = _sounds.classify(resample_pcm(audio, MIC_RATE, VOSK_RATE))
-    sounds.publish(top)
-    print(f"sounds: {top}")
-
-
 def _load_senses() -> None:
-    """Sound names and voice prints, in the background -- optional: no model, no names."""
-    global _sounds, _voices
-    try:
-        _sounds = sounds.Classifier()
-    except Exception as e:
-        print(f"sounds: off ({e})")
+    """Voice prints, in the background -- optional: no model, no names. (Sound
+    names are openbot-ears' job.)"""
+    global _voices
     try:
         _voices = voices.VoiceEngine()
     except Exception as e:
@@ -869,8 +846,9 @@ def main() -> None:
     # without this reset, in_session stays True and mind/alive stay frozen.
     state.update_session({"in_session": False, "listening": False})
 
-    device = mic_stream.resolve_device(cfg.STT_DEVICE)
-    mic = mic_stream.ArecordStream(device)
+    # openbot-ears owns the mic; this listens to its live audio (same format, whole chunks)
+    mic = mic_stream.ArecordStream("openbot-ears", rate=MIC_RATE, chunk_frames=hearing.CHUNK_FRAMES,
+                                   cmd=hearing.pcm_command())
     mic.start_stream()
 
     wake_model = _wake_model = vosk.Model(_vosk_model_path())
@@ -892,26 +870,17 @@ def main() -> None:
     # "Rocky" we can hand Whisper everything from that word on.
     recent: deque[tuple[float, bytes]] = deque(maxlen=int(8 * mic.rate / chunk_frames))
     fed_s = 0.0
-    levels: deque[float] = deque(maxlen=30)  # per-second peak loudness, for openbot-mind's surprise detection
-    second_peak, next_publish = 0.0, time.time() + 1.0
     next_invite_check = 0.0
     while True:
         health.record_success(COMPONENT, min_interval_s=5.0)
         chunk = mic.read(chunk_frames)
         if not chunk:
             if not mic.is_running():
-                # arecord died (device busy/unplugged, e.g. grabbed at boot) -- exit
-                # so systemd restarts us, instead of spinning deaf forever.
-                raise SystemExit("arecord exited -- mic unavailable")
+                # openbot-ears' audio stopped (it restarted, or the mic is gone) -- exit
+                # so systemd restarts us and we reconnect, instead of sitting deaf forever.
+                raise SystemExit("the audio from openbot-ears stopped")
             time.sleep(0.05)
             continue
-        second_peak = max(second_peak, _rms(chunk))
-        if time.time() >= next_publish:
-            levels.append(round(second_peak))
-            sensors.publish_hearing(list(levels))
-            if _sounds is not None and not speak_mod.playing() and surprise.loudness_events(list(levels)):
-                _label_sound(recent)  # the mind's "a sudden sound" gets a name
-            second_peak, next_publish = 0.0, time.time() + 1.0
         if speak_mod.playing():
             continue  # its own voice ("Rocky ready!") must not count as its name
         if time.time() >= next_invite_check:

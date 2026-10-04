@@ -45,7 +45,6 @@ DECIDER = os.environ.get("OPENBOT_DECIDER", "")
 DECIDER_MIN_CONFIDENCE = float(os.environ.get("OPENBOT_DECIDER_MIN_CONFIDENCE", "0.6"))
 
 # --- STT / mic ------------------------------------------------------------
-STT_DEVICE = os.environ.get("OPENBOT_STT_DEVICE", "USB PnP Sound Device")
 STT_LANGUAGE = os.environ.get("OPENBOT_STT_LANGUAGE", "en-us")  # en-in: Indian English; accent match beat model size, see README
 # Whisper re-checks what Vosk wasn't sure of (common/stt.py). A model name
 # (downloaded once) or a local model dir; "" -> Vosk only. base.en: ~2.3s per

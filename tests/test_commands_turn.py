@@ -1,7 +1,7 @@
 """Voice commands through the real conversation turn (services.wake_listen._run_turn):
 "be quiet" / "stop session" end the conversation (Rocky stays awake); "go to
-sleep" ends it and sleeps, head down. Then the same commands texted on WhatsApp
-(/be-quiet, /go-to-sleep, /wake-up -> wake_listen._do_remote). Speech, motors
+sleep" ends it and sleeps, head down. Then the same, used by text on WhatsApp
+(skills end_conversation, sleep, wake_up, volume -> wake_listen._do_remote). Speech, motors
 and the LLM are stubbed -- the robot stays silent and still. Isolated state.
 
     cd ~/openbot && python3 -m tests.test_commands_turn
@@ -51,4 +51,8 @@ assert texted(commands.STOP_SESSION, in_session=True) is False and not state.loa
 assert texted(commands.SLEEP, in_session=False, age=300) and not state.load_session()["asleep"]  # stale: dropped
 assert texted(commands.SLEEP, in_session=False) is False and state.load_session()["asleep"]
 assert texted(commands.WAKE, in_session=False) and not state.load_session()["asleep"] and ["look ahead"] in moved
+import common.system as system  # noqa: E402 -- volume by text (skills/volume): turned down at home, said out loud
+volume = [60]
+system.get_volume, system.set_volume = (lambda: volume[0]), (lambda v: volume.__setitem__(0, v) or v)
+assert texted(commands.SOFTER, in_session=False) and volume[0] == 45
 print("test_commands_turn: ok")

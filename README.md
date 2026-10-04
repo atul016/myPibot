@@ -46,7 +46,7 @@ The dashboard is at `http://<robot-ip>:8080`; logs: `journalctl -u openbot-wake-
 | `OPENBOT_BODY` | `none` (talks, sees, thinks -- never moves) or `picarx` |
 | `OPENBOT_PERSONA` | which `personas/<name>/` to be |
 | `OPENBOT_LLM_BASE_URL`, `OPENBOT_LLM_MODEL` | the brain |
-| `OPENBOT_STT_DEVICE` | part of your mic's name in `arecord -l` |
+| `OPENBOT_STT_DEVICE` | part of your mic's name in `arecord -l` (openbot-ears opens it) |
 | `OPENBOT_MIXER` | `card:control` for "louder"/"softer" (`amixer -c 0 scontrols`) |
 | `OPENBOT_CAMERA_CMD` | a USB webcam instead of the Pi camera (example in the template) |
 
@@ -184,7 +184,7 @@ auth, and its ~1235-test suite.
 ## Feeling alive: surprise, eyes, curiosity, conversation
 
 - **Wake on surprise** (`common/surprise.py`, `services/mind.py`) -- mind samples
-  sensors + mic loudness every 2s. Something approaching, a sudden sound, being
+  sensors + what openbot-ears heard every 2s. Something approaching, a sudden sound, being
   picked up, or a changed camera scene triggers a reflection *right away*
   (rate-limited by `SURPRISE_MIN_GAP_S`), not just on the 5-min idle timer.
   The robot's own speech/gestures stamp `self_noise_ts`; sound/vision
@@ -195,6 +195,11 @@ auth, and its ~1235-test suite.
   in the dashboard's Camera tab, with the object detector's boxes drawn over it. Everyone else
   asks it for frames. The detector (`common/objects.py`) runs every 2s, or on every frame
   (~9/s on a Pi 5) while someone calls `objects.want_fast()` -- the Camera tab, or following.
+- **Ears** (`services/ears.py`, `openbot-ears`) -- the microphone's sole owner (`arecord`), served
+  on 127.0.0.1:9001 only -- it's the house's live audio: `/pcm` is the live stream (openbot-wake-listen
+  listens to it, ~3ms behind the mic), `/hearing` each of the last 30s's peak loudness and what it
+  sounded like (YAMNet on every second; "own voice" while the robot talks). The mind asks it
+  (`common/hearing.py`) -- no file in between, so "not answering" can't pass for "silence".
 - **Eyes** (`common/vision.py`) -- a frame from openbot-camera (fallback: one-shot `rpicam-still`; never vilib) every
   `VISION_INTERVAL_S` -> the vision LLM describes the scene and says what
   changed since the last look that way. Frames darker than `DARK_BRIGHTNESS`
@@ -225,8 +230,8 @@ auth, and its ~1235-test suite.
   its views and tells it "you may face another way now".
 - **Names what it sees and hears** -- objects (`common/objects.py`: NanoDet, OpenCV's model zoo,
   every 2 s in openbot-camera: "a person, a chair and a laptop" in every prompt, and grounding each
-  look), sounds (`common/sounds.py`: Google's YAMNet, only the moment the room gets loud: "a sudden
-  sound -- it sounded like: Knock"), and voices (`common/voices.py`: WeSpeaker voice prints, learned
+  look), sounds (`common/sounds.py`: Google's YAMNet on every second openbot-ears hears: "a sudden
+  sound -- it sounded like: Knock", and the `listen` tool: "it sounded like: Speech, Music"), and voices (`common/voices.py`: WeSpeaker voice prints, learned
   like faces -- while it sees exactly one face it knows, that person's words teach it their voice;
   when no face says who's talking, the voice can). Models: `setup.sh`, into `~/.openbot-models`.
 - **Motion** (`services/camera.py`) -- frame-to-frame change, twice a second, becomes a
@@ -257,7 +262,9 @@ The robot finds it on the same host as the LLM server. End of speech -> transcri
 `openbot-chat` (`services/chat.py`) lets you text the bot. It answers as itself: the same
 prompt, journal and memories as when you talk to it, plus what its camera sees right now,
 and it sends you that photo when you ask to see ("show me"). Send it a photo and it looks
-at yours instead. It never moves from a text: nobody may be watching the table edge.
+at yours instead. What it can do from a text is its [skills](#skills-what-it-can-do): it
+decides from your words -- no exact commands. It never moves from a text: nobody may be
+watching the table edge, so it tells you to ask out loud.
 
 The robot logs in as a **linked device of a spare WhatsApp number**, the way WhatsApp Web
 does ([neonize](https://github.com/krypton-byte/neonize)). It only connects out, so no
@@ -279,8 +286,9 @@ Open WhatsApp on the spare phone at least every 14 days, or WhatsApp logs the ro
 someone it already knows) and that number is Atul's -- the person it knows by face and in its
 notes, which gain "Atul texts me on WhatsApp". The number itself stays in `~/.openbot-whatsapp/`.
 
-**Commands** -- texted exactly, they work as if said out loud next to it: `/be-quiet` (ends a
-conversation someone is having with it), `/go-to-sleep`, `/wake-up`.
+**Asking it to do things** -- in your own words: "stop texting me for an hour", "remind me at 17:30
+to call mom", "send me a pic", "you're too loud", "go to sleep" / "wake up", "be quiet" (ends a
+conversation someone is having with it out loud). See [Skills](#skills-what-it-can-do).
 
 **It texts first**, too:
 - how its day went, at 8 PM (`OPENBOT_CHAT_SUMMARY_AT=20:00`), and last night's dream in the
@@ -351,6 +359,38 @@ nothing: say "Where did you go?" and keep looking ~10s. The first floor edge end
 In the sim, with a walking person (waypoints, pauses, missed detections): across a
 room 25/25, round to his side 25/25, behind him and back 24/25 (0/25 without the
 keep-looking), past a desk edge -- stops at the edge 25/25; 0 falls, 0 bumps.
+
+## Skills: what it can do
+
+Everything it can do is a **skill** (`common/skills.py`): a folder in `skills/` with a Markdown file the LLM reads
+(what it does, when to use it, when not, what it needs) and, if it needs one, a Python file
+that does it. No phrase lists in code, no rules written into prompts -- edit the `.md` to
+change how a skill gets used; a new skill is a new folder.
+
+```
+skills/pause_texting/pause_texting.md      skills/pause_texting/pause_texting.py
+---                                        def run(ctx, minutes):
+name: pause_texting                            ...hold back the texts it starts...
+description: Stop texting them first...        return "You won't text them first until 15:20."
+where: text, voice
+params:
+  minutes (integer): how long -- 60 is an hour
+---
+Use when they ask you not to message them for a while: "stop texting me for an hour"...
+```
+
+`where` says which channels may use it (`text`, `voice`, `mind`); `needs: body` hides it on a
+robot that can't drive. A turn is three steps, like a person: **decide** (a short LLM call that
+sees every skill the body has and answers only with the ones the message asks for), **do**
+(code keeps what this channel may do -- a text can't drive -- and runs each skill's `run()`,
+which says what happened), then **say** (the persona writes the reply, told exactly what was
+done -- so it can't claim a move it didn't make). Reflexes stay in code: an instant "stop",
+edge and battery safety.
+
+Measured through the real LLM (`tests/test_chat_skills.py`, 11 texts x 5): 54/55 right --
+the one miss a wording, not a decision -- vs 29/33 when one call both chose and replied ("look
+left" got "Looking left!" every time). Texting runs on skills now; speaking and the mind's own
+tools are next.
 
 ## Voice commands (`common/commands.py`)
 

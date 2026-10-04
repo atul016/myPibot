@@ -76,7 +76,8 @@ def _shut_down(pct: float) -> None:
     journal.log("did", f"battery at {pct:.0f}% -- shutting down before it dies")
     dash_events.log_event("safety", f"battery at {pct:.0f}% -- shutting down")
     state.update_session({"text_out": {"text": f"My battery is at {pct:.0f}% -- I'm shutting myself down now. "
-                                               "Please charge me!", "photo": False, "ts": time.time()}})
+                                               "Please charge me!", "photo": False, "ts": time.time(),
+                                      "urgent": True}})  # goes out even if they asked for a break from its texts
     speak_client("Battery empty. Shutting down.")
     time.sleep(15)  # time for the WhatsApp text to go out
     subprocess.run(["sudo", "-n", "shutdown", "now"], check=False)

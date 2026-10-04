@@ -18,10 +18,7 @@ import re
 from .persona import CURRENT
 
 STOP_SESSION, SLEEP, LOUDER, SOFTER = "stop_session", "sleep", "louder", "softer"
-WAKE = "wake"  # texted only: a spoken "wake up" goes through the wake word
-# Texted on WhatsApp (services/chat.py), exactly; wake-listen carries them out as if
-# they had been said out loud. "quite": how "quiet" often gets typed, too.
-SLASH = {"/be-quiet": STOP_SESSION, "/be-quite": STOP_SESSION, "/go-to-sleep": SLEEP, "/wake-up": WAKE}
+WAKE = "wake"  # by text only (skills/wake_up): a spoken "wake up" goes through the wake word
 
 _PHRASES = {
     STOP_SESSION: {"stop session", "end session", "stop the session", "end the session", "session stop",

@@ -19,7 +19,7 @@ from common import agenda, faces, health, jev, journal, memory, objects, sensors
 from dashboard.page import PAGE
 
 PORT = int(os.environ.get("OPENBOT_DASHBOARD_PORT", "8080"))
-HEALTH_COMPONENTS = ["openbot-alive"] * (os.environ.get("OPENBOT_BODY", "none") != "none") + ["openbot-wake-listen", "openbot-mind", "openbot-speak", "openbot-camera"] \
+HEALTH_COMPONENTS = ["openbot-alive"] * (os.environ.get("OPENBOT_BODY", "none") != "none") + ["openbot-ears", "openbot-wake-listen", "openbot-mind", "openbot-speak", "openbot-camera"] \
     + ["openbot-chat"] * bool(os.environ.get("OPENBOT_CHAT_ALLOW"))
 STATE_ROOT = state.STATE_DIR.resolve()
 

@@ -25,9 +25,10 @@ def build_system_prompt(allowed_actions: list[str], stationary_actions: list[str
             "Do NOT include any hidden thinking, analysis, or tags like <think> "
             "in `reply`."
         )
+    # allowed_actions empty, with a body: a channel whose skills say what it can do (common/skills.py)
+    moves = f"You can perform these physical actions: {', '.join(allowed_actions)}. " if allowed_actions else ""
     return (
-        PERSONA_VOICE + "\n\n"
-        f"You can perform these physical actions: {', '.join(allowed_actions)}. "
+        PERSONA_VOICE + "\n\n" + moves +
         "Your reply is structured into two fields: `reply` (what you say out "
         "loud) and `tone_action` -- you don't need to format these yourself, "
         "just fill each one in per the rules below.\n"
@@ -41,9 +42,9 @@ def build_system_prompt(allowed_actions: list[str], stationary_actions: list[str
         "separately and is visible on its own; say something a person would "
         "actually say in reaction (\"Got it!\", \"Whee!\", \"Sure thing.\", "
         "\"Hey, personal space!\") that has nothing to do with naming what "
-        "your body is doing. Movement itself isn't something you choose here "
-        f"-- {NAME} moves only when the person's own words plainly ask for "
-        "it.\n\n"
+        "your body is doing." + (" Movement itself isn't something you choose here "
+                                  f"-- {NAME} moves only when the person's own words plainly ask for it."
+                                  if allowed_actions else "") + "\n\n"
         "Do NOT include any hidden thinking, analysis, or tags like <think> "
         "in `reply`."
     )

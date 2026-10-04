@@ -1,7 +1,7 @@
 [Unit]
 Description=OpenBot wake-listen (wake word -> STT -> reactive voice-loop turn)
-After=network-online.target openbot-memory.service sound.target openbot-alive.service openbot-speak.service
-Wants=network-online.target
+After=network-online.target openbot-memory.service sound.target openbot-ears.service openbot-alive.service openbot-speak.service
+Wants=network-online.target openbot-ears.service
 
 [Service]
 Type=simple

@@ -30,8 +30,9 @@ DEFAULT_SESSION: dict[str, Any] = {
     "mood": "neutral",
     "confirm_motion_allowed": True,
     "asleep": False,  # "go to sleep": camera off, no thinking, no moving -- the wake word wakes it
-    "remote_command": None,  # commands.SLASH texted on WhatsApp, for wake-listen to carry out
+    "remote_command": None,  # a mode skill used by text (sleep, wake_up...), for wake-listen to carry out
     "text_out": None,  # a WhatsApp text the mind decided on, for openbot-chat to send
+    "texts_paused_until": {},  # number ("*": everyone) -> unix time: don't text them first till then (skills/pause_texting)
 }
 
 # A session stays open until "stop session" -- but the mind shouldn't stay
@@ -113,6 +114,13 @@ def conversation_active(session: dict | None = None) -> bool:
     mind think (and speak up) again."""
     s = session if session is not None else load_session()
     return bool(s.get("in_session")) and time.time() - s.get("last_activity_ts", 0) < CONVERSATION_IDLE_S
+
+
+def texting_paused(number: str, session: dict | None = None) -> bool:
+    """They asked not to be texted first for a while (skills/pause_texting): the
+    texts it starts wait -- its answers, and reminders they asked for, don't."""
+    paused = (session if session is not None else load_session()).get("texts_paused_until") or {}
+    return time.time() < max(paused.get(number, 0), paused.get("*", 0))
 
 
 def mark_self_noise() -> None:
