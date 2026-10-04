@@ -128,16 +128,25 @@ def _face_loop() -> None:
 
 
 def _object_loop() -> None:
-    """What's in frame, by name, every OBJECT_INTERVAL_S -> state/objects.json
+    """What's in frame, by name, every OBJECT_INTERVAL_S -- every new frame while
+    someone wants it fast (objects.want_fast) -> state/objects.json
     (common/objects.py). Optional, like faces: no model, no names."""
     try:
         detector = objects.Detector()
     except Exception as e:
         print(f"{COMPONENT}: object detection off ({e})")
         return
+    import cv2
+    cv2.setNumThreads(2)  # measured on the Pi 5: 96ms a frame vs 89ms on all 4 -- leaves cores for audio
     last = 0.0
     while True:
-        time.sleep(objects.OBJECT_INTERVAL_S)
+        if objects.fast_wanted():
+            with _new_frame:
+                _new_frame.wait_for(lambda: _frame_ts > last, timeout=1.0)
+        else:  # a nap that a fast request cuts short
+            deadline = time.time() + objects.OBJECT_INTERVAL_S
+            while time.time() < deadline and not objects.fast_wanted():
+                time.sleep(0.1)
         with _new_frame:
             frame, ts = _frame, _frame_ts
         if frame and ts > last:  # asleep or stalled: nothing published, so readers see it as stale

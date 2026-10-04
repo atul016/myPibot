@@ -17,6 +17,11 @@ MODEL = MODEL_DIR / "object_detection_nanodet_2022nov.onnx"
 OBJECTS_PATH = STATE_DIR / "objects.json"
 OBJECT_INTERVAL_S = 2.0
 STALE_S = 10.0
+# Someone needs boxes NOW (following a person, the dashboard's live view): while this
+# file was touched in the last FAST_FOR_S, openbot-camera detects on every new frame
+# (~8-10/s on the Pi 5) instead of every OBJECT_INTERVAL_S. Expires on its own.
+FAST_PATH = STATE_DIR / "objects_fast"
+FAST_FOR_S = 3.0
 COCO = [c.replace("_", " ") for c in (  # the 80 COCO kinds, in the model's order
     "person bicycle car motorcycle airplane bus train truck boat traffic_light fire_hydrant stop_sign parking_meter "
     "bench bird cat dog horse sheep cow elephant bear zebra giraffe backpack umbrella handbag tie suitcase frisbee "
@@ -78,13 +83,30 @@ def publish(found: list[dict]) -> None:
     atomic_write(OBJECTS_PATH, json.dumps({"objects": found, "ts": time.time()}))
 
 
-def read() -> list[dict]:
-    """[] if missing or stale (camera off, asleep, detector not running)."""
+def latest() -> tuple[list[dict], float]:
+    """(the newest boxes, when they were published) -- ([], 0.0) if there are none."""
     try:
         data = json.loads(OBJECTS_PATH.read_text())
     except (OSError, json.JSONDecodeError):
-        return []
-    return data.get("objects", []) if time.time() - data.get("ts", 0) < STALE_S else []
+        return [], 0.0
+    return data.get("objects", []), data.get("ts", 0.0)
+
+
+def read(max_age_s: float = STALE_S) -> list[dict]:
+    """[] if missing or older than max_age_s (camera off, asleep, detector not running)."""
+    found, ts = latest()
+    return found if time.time() - ts < max_age_s else []
+
+
+def want_fast() -> None:
+    FAST_PATH.touch()
+
+
+def fast_wanted() -> bool:
+    try:
+        return time.time() - FAST_PATH.stat().st_mtime < FAST_FOR_S
+    except OSError:
+        return False
 
 
 def names(found: list[dict]) -> str | None:
@@ -101,6 +123,25 @@ def demo() -> None:
     assert "dining table" in COCO and "cell phone" in COCO
     assert names([{"name": "person"}, {"name": "cup"}, {"name": "cup"}]) == "a person and 2 cups"
     assert names([]) is None and names([{"name": "chair"}]) == "a chair"
+    import os
+    import shutil, tempfile
+    from pathlib import Path
+    global OBJECTS_PATH, FAST_PATH
+    orig, test_dir = (OBJECTS_PATH, FAST_PATH), Path(tempfile.mkdtemp())
+    OBJECTS_PATH, FAST_PATH = test_dir / "objects.json", test_dir / "objects_fast"
+    try:
+        assert not fast_wanted()
+        want_fast()
+        assert fast_wanted()
+        os.utime(FAST_PATH, (time.time() - FAST_FOR_S - 1,) * 2)
+        assert not fast_wanted()  # expires by itself
+        publish([{"name": "person", "score": 0.9, "box": [0.1, 0.1, 0.5, 0.9]}])
+        assert read()[0]["name"] == "person" and read(max_age_s=0.5)
+        OBJECTS_PATH.write_text(json.dumps({"objects": [{"name": "cup"}], "ts": time.time() - 1}))
+        assert read() and not read(max_age_s=0.5)  # fine for the mind, too old to steer by
+    finally:
+        OBJECTS_PATH, FAST_PATH = orig
+        shutil.rmtree(test_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

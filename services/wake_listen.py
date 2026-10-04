@@ -270,7 +270,7 @@ def _reply_sentences(persona, Reply, user_text: str, history: list[dict], out: d
         f"\"be quiet\" (ends this conversation), \"go to sleep\" (everything off until \"{persona.name}, wake up\"). "
         "If they seem to want one of those, tell them the words to say instead of promising it. " +
         ("You drive only on these exact spoken commands: \"go to the <thing>\", \"come here\", "
-         "\"explore\", \"stop\" (and simple forward/back/turn). Never claim you're driving otherwise -- "
+         "\"follow me\", \"explore\", \"stop\" (and simple forward/back/turn). Never claim you're driving otherwise -- "
          "tell them the words. " if cfg.CAN_DRIVE else
          "You have no wheels or arms: you can't move at all, so never claim you're moving. ") +
         "You can't press buttons or pick things up.\n\n"
@@ -474,15 +474,18 @@ def _do_navigation(persona, nav: tuple[str, str | None], mic: mic_stream.Arecord
         _say_line(persona, "They said stop -- you've just stopped driving." if cancel_navigation()
                   else "They said stop, but you weren't moving anyway.", "Okay.", mic)
         return True
-    ok, err = navigate({"approach": target} if kind == "approach" else {"explore": 60})
+    ok, err = navigate({"follow": True} if kind == "follow" else {"approach": target} if kind == "approach"
+                       else {"explore": 60})
     if not ok:
         _say_line(persona, "They asked you to drive somewhere, but you're already on your way somewhere -- "
                   "they'd have to say stop first." if "already" in err
                   else "They asked you to drive somewhere, but your wheels aren't answering right now.",
                   "I can't drive right now.", mic)
         return True
-    journal.log("did", f"started driving {'to the ' + target if target else 'around to explore'}")
-    _say_line(persona, "They said come here, and you've just set off toward them." if target == "person"
+    journal.log("did", "started following them" if kind == "follow"
+                else f"started driving {'to the ' + target if target else 'around to explore'}")
+    _say_line(persona, "They said follow me, and you've just started following them." if kind == "follow"
+              else "They said come here, and you've just set off toward them." if target == "person"
               else f"They asked you to go to the {target}, and you've just set off toward it." if target
               else "They told you to go explore, and you've just set off.", "Okay!", mic)
     return True

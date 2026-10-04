@@ -1,0 +1,78 @@
+{
+ "description": "Follow me across a room's floor: the person walks ahead, turns left, then crosses back and stands still. Rocky must keep up at his own pace, never bump them, and end near them.",
+ "table": [
+  0,
+  0,
+  300,
+  250
+ ],
+ "robot": [
+  40,
+  125,
+  0
+ ],
+ "obstacles": [
+  {
+   "shape": "rect",
+   "x": 0,
+   "y": 0,
+   "w": 300,
+   "h": 4
+  },
+  {
+   "shape": "rect",
+   "x": 0,
+   "y": 246,
+   "w": 300,
+   "h": 4
+  },
+  {
+   "shape": "rect",
+   "x": 0,
+   "y": 0,
+   "w": 4,
+   "h": 250
+  },
+  {
+   "shape": "rect",
+   "x": 296,
+   "y": 0,
+   "w": 4,
+   "h": 250
+  },
+  {
+   "shape": "rect",
+   "x": 240,
+   "y": 60,
+   "w": 40,
+   "h": 40
+  },
+  {
+   "shape": "circle",
+   "x": 130,
+   "y": 125,
+   "r": 15,
+   "label": "person",
+   "walk": [
+    [
+     200,
+     125
+    ],
+    [
+     230,
+     180
+    ],
+    [
+     150,
+     210
+    ]
+   ],
+   "speed": 12,
+   "wait": 2
+  }
+ ],
+ "task": {
+  "follow": 60
+ },
+ "expect": "reach"
+}

@@ -113,11 +113,15 @@ def _navigate(car, monitor, task: dict, action_flow) -> None:
     from movement.real_body import RealBody
 
     body = RealBody(car, monitor, cfg, NAV_CANCEL)
-    target = task.get("approach")
-    dash_events.log_event("safety", f"driving: {'to the ' + target if target else 'exploring'}")
+    target, following = task.get("approach"), bool(task.get("follow"))
+    dash_events.log_event("safety", "driving: following a person" if following
+                          else f"driving: {'to the ' + target if target else 'exploring'}")
     try:
+        if following:
+            body.tilt = navigate.FOLLOW_TILT  # head up at the person, not down at the floor
         body.look(0)  # driving pose (head down at the floor ahead) -- wherever the face tracker left it
-        outcome = navigate.approach(body, target) if target else navigate.explore(body, int(task.get("explore", 60)))
+        outcome = (navigate.follow(body) if following else navigate.approach(body, target) if target
+                   else navigate.explore(body, int(task.get("explore", 60))))
     except Exception as e:  # never leave the motors running on a bug
         outcome = navigate.Outcome(False, f"something went wrong ({e})")
     finally:
@@ -125,12 +129,14 @@ def _navigate(car, monitor, task: dict, action_flow) -> None:
         car.set_dir_servo_angle(0)
         body.look(0)
         NAVIGATING.clear()
-    what = f"drove {'to the ' + target if target else 'around exploring'}: {outcome.reason}"
+    what = (f"followed someone: {outcome.reason}" if following
+            else f"drove {'to the ' + target if target else 'around exploring'}: {outcome.reason}")
     dash_events.log_event("safety", f"driving done: {outcome.reason} ({outcome.steps} steps)")
     print(f"drive: done -- {outcome.reason} ({outcome.steps} rounds)")
     journal.log("did", what)
     # How it went is the LLM's to tell (in its mood); the facts come from the drive.
     situation = (f"You just stopped driving because they said stop." if outcome.reason == "cancelled"
+                 else f"You were following them, and you've stopped: {outcome.reason}." if following
                  else f"You just made it to the {target}!" if target and outcome.done
                  else f"Your drive ended: {outcome.reason}." + (f" Along the way you saw: {', '.join(outcome.seen)}."
                                                               if outcome.seen else ""))

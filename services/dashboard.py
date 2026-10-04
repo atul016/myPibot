@@ -15,7 +15,7 @@ from pathlib import Path
 from flask import Flask, Response, send_file
 
 from common import events as dash_events
-from common import agenda, faces, health, jev, journal, memory, sensors, state, stats, vision
+from common import agenda, faces, health, jev, journal, memory, objects, sensors, state, stats, vision
 from dashboard.page import PAGE
 
 PORT = int(os.environ.get("OPENBOT_DASHBOARD_PORT", "8080"))
@@ -117,6 +117,14 @@ def api_jev():
 def api_vision():
     """What Rocky last saw: {scene, direction, ts, by_direction, ...}."""
     return Response(json.dumps(vision.last_look()), mimetype="application/json")
+
+
+@app.route("/api/objects")
+def api_objects():
+    """The detector's latest boxes, for drawing over the live video -- asking keeps
+    openbot-camera detecting on every frame while the Camera tab is open."""
+    objects.want_fast()
+    return Response(json.dumps(objects.read(max_age_s=2.0)), mimetype="application/json")
 
 
 @app.route("/api/camera.mjpg")

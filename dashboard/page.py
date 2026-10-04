@@ -1,8 +1,8 @@
 """Dashboard HTML -- pure string template, no framework/persona dependency,
 so this module stays importable in isolation. Tabs: Agent loop
 (wake/heard/reply events + sensors and service health), Mind (its inner life),
-Dreams & wishes (nightly dream notes, wishes, self-written rules), Camera (Rocky's latest photo + what it made of it, via
-/api/camera.jpg and /api/vision), Jev (every question asked of the Jev decision
+Dreams & wishes (nightly dream notes, wishes, self-written rules), Camera (live video with the object detector's
+boxes, via /api/camera.mjpg and /api/objects, + what Rocky made of its last look, via /api/vision), Jev (every question asked of the Jev decision
 model and its answer, via /api/jev), Stats (is it getting better, per day, via
 /api/stats), and Files (browse the raw state/ files
 every service generates). Fed by /api/stream (Server-Sent Events)
@@ -107,12 +107,16 @@ PAGE = """<!DOCTYPE html>
 <div class="panel" id="panel-camera">
   <div class="cols">
     <div class="col" style="flex:2">
-      <div class="card"><img id="cam-img" alt="Camera stream unavailable (openbot-camera down?)" style="width:100%;max-width:640px;border-radius:6px;display:block"></div>
+      <div class="card"><div style="position:relative;max-width:640px">
+        <img id="cam-img" alt="Camera stream unavailable (openbot-camera down?)" style="width:100%;border-radius:6px;display:block">
+        <canvas id="cam-boxes" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none"></canvas>
+      </div></div>
     </div>
     <div class="col">
       <div class="card"><b>What it sees</b><div id="cam-scene" style="margin-top:8px"></div></div>
       <div class="card"><b>Last look each way</b><div id="cam-dirs"></div></div>
-      <div class="card" style="color:#999;font-size:13px">Live video (~10 fps). The description is from the bot's
+      <div class="card" style="color:#999;font-size:13px">Live video (~10 fps), with boxes around what the object
+        detector sees (green: people). The description is from the bot's
         last look -- it thinks about a frame every ~90s, or whenever it decides to <code>look</code>.</div>
     </div>
   </div>
@@ -287,9 +291,28 @@ function loadCamera() {
 // Live MJPEG straight from openbot-camera; only connected while the tab is
 // open, so a background dashboard tab doesn't hold a stream.
 const camImg = document.getElementById('cam-img');
+// Live boxes over the video, ~4x a second while the tab is open (asking keeps the
+// detector running on every frame -- /api/objects).
+const camBoxes = document.getElementById('cam-boxes');
+let boxTimer = null;
+function drawBoxes(found) {
+  const r = camBoxes.getBoundingClientRect();
+  camBoxes.width = r.width; camBoxes.height = r.height;
+  const g = camBoxes.getContext('2d');
+  g.lineWidth = 2; g.font = '13px sans-serif';
+  for (const o of found) {
+    const [l, t, rt, b] = o.box;
+    g.strokeStyle = g.fillStyle = o.name === 'person' ? '#38a169' : '#3182ce';
+    g.strokeRect(l * r.width, t * r.height, (rt - l) * r.width, (b - t) * r.height);
+    g.fillText(`${o.name} ${Math.round(o.score * 100)}%`, l * r.width + 3, Math.max(13, t * r.height - 4));
+  }
+}
 function setStream(on) {
   if (on) camImg.src = '/api/camera.mjpg';
   else camImg.removeAttribute('src');  // closes the stream
+  clearInterval(boxTimer);
+  boxTimer = on ? setInterval(() => fetch('/api/objects').then(r => r.json()).then(drawBoxes).catch(() => {}), 250) : null;
+  if (!on) drawBoxes([]);
 }
 setInterval(() => {
   if (document.getElementById('panel-camera').classList.contains('active')) loadCamera();

@@ -17,7 +17,7 @@ import time
 
 import requests
 
-from common import vision
+from common import objects, vision
 from movement.navigate import Sighting
 from movement.triggers import POISONED_ADC
 
@@ -29,6 +29,8 @@ SERVO_SETTLE_S = 0.35
 # mouse 25cm ahead. picarx tilt: + = up.
 DRIVE_TILT = -20
 TICK_S = 0.05                   # same 20Hz as the sim and the safety loop
+PERSON_FRESH_S = 0.6            # follow: a detection older than this isn't where they are now
+DETECT_S = 0.15                 # a frame from after the head settled is published about this much later
 
 
 def _new_tracker():
@@ -53,6 +55,8 @@ class RealBody:
     def __init__(self, car, monitor, cfg, cancel: threading.Event):
         self.car, self.monitor, self.cfg, self.cancel = car, monitor, cfg, cancel
         self.pan = 0.0
+        self.tilt = DRIVE_TILT          # navigate.follow looks up instead (alive sets FOLLOW_TILT)
+        self.settled = 0.0              # when the head last stopped moving
         self.tracker = None
 
     def cancelled(self) -> bool:
@@ -74,8 +78,9 @@ class RealBody:
         self.pan = max(-60.0, min(60.0, pan_deg))
         self.tracker = None  # it was following the old view
         self.car.set_cam_pan_angle(int(-self.pan))
-        self.car.set_cam_tilt_angle(DRIVE_TILT)
+        self.car.set_cam_tilt_angle(self.tilt)
         time.sleep(SERVO_SETTLE_S)
+        self.settled = time.time()
 
     def _frame(self) -> bytes | None:
         return vision.capture()
@@ -135,6 +140,34 @@ class RealBody:
         s = self._sighting(x / w, y / h, (x + bw) / w, (y + bh) / h)
         print(f"drive:   track {s.bearing:+.0f} deg, width {s.width:.2f}, bottom {s.bottom:.2f}, distance {self.distance()}")
         return s
+
+    def person(self) -> Sighting | None:
+        """The biggest (nearest) person openbot-camera's detector sees now -- it's
+        asked to run on every frame while we follow. Right after a head move
+        (standing still), waits (<=1s) for a detection of the new view; never
+        while driving -- the drive loop checks the floor every 50ms."""
+        # ponytail: biggest box, no memory of WHICH person -- two people can swap. Track by
+        # bearing (or face) if that's seen live.
+        while True:
+            objects.want_fast()
+            found, ts = objects.latest()
+            if ts > self.settled + DETECT_S and time.time() - ts < PERSON_FRESH_S:
+                break
+            if time.time() - self.settled > 1.0 or getattr(self, "started", None):  # driving: never wait here
+                return None
+            time.sleep(0.03)
+        people = [self._sighting(*o["box"]) for o in found if o["name"] == "person"]
+        if not people:
+            return None
+        s = max(people, key=lambda p: p.width)
+        s.bottom = None  # head tipped up: their feet are below the frame, so the bottom edge isn't distance
+        return s
+
+    def say(self, text: str) -> None:
+        """Out loud, in the persona's voice -- without waiting: the search goes on meanwhile."""
+        from common import persona
+        from common.speak_client import speak
+        threading.Thread(target=speak, args=(persona.load().transform(text),), daemon=True).start()
 
     def glance(self) -> list[str]:
         jpeg = self._frame()

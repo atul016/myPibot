@@ -49,6 +49,7 @@ class Body(Protocol):
     def wait(self, seconds: float) -> str: ...                # let time pass driving: "ok"|"fell"|"hit"|"cancelled"
     def acquire(self, target: str) -> Sighting | None: ...   # slow, smart (the vision model): find + start tracking
     def track(self, target: str) -> Sighting | None: ...     # fast (a video tracker, ~10Hz): where it is now, or lost
+    def person(self) -> Sighting | None: ...                 # follow(): the object detector's newest person, or None
 
 
 # --- tuning (each one exercised by the sim's scenarios) ---------------------------
@@ -323,3 +324,116 @@ def explore(body: Body, max_steps: int = 120, rng: random.Random | None = None) 
         return Outcome(True, "explored", max_steps, sorted(seen))
     except Stop as e:
         return Outcome(False, str(e), 0, sorted(seen))
+
+
+# --- following a person ("follow me") ----------------------------------------------------
+# Calibration knobs. Measured 2026-10-04, one person standing in front of the real
+# camera (~13cm off the floor): detected ~9x/s at every tilt and distance tried. At
+# tilt 30 their box was 0.72 of the view wide at 0.5m, 0.43 at 1m, 0.34 at 2m; level
+# (tilt 0) the widths didn't track distance at all (more of the body shows farther away).
+FOLLOW_SPEED = 30          # the house rule's test speed
+FOLLOW_TILT = 30           # real robot: head tipped up -- body width then tracks distance
+FOLLOW_STOP_CM = 50.0      # moving, something this close ahead (them, usually) -> stop...
+FOLLOW_GO_CM = 70.0        # ...and wait until it's this far again (no stop-go jitter)
+FOLLOW_CLOSE_WIDTH = 0.6   # this wide in the view = close, ~0.65m (the ultrasonic misses people off-centre)
+FOLLOW_GO_WIDTH = 0.5      # ...and narrower than this = they've walked on, ~0.8m
+FOLLOW_SMALL_WIDTH = 0.2   # something inside FOLLOW_STOP_CM while they look this small isn't them
+FOLLOW_GRACE_S = 0.5       # the detector missed a frame or two: keep going on the last sighting
+FOLLOW_MAX_TRIES = 6        # searches and head turns in a row without driving -> give up
+FOLLOW_SEEK_SWEEPS = 3      # lost: call out, then this many more looks around (~10s) before giving up
+FOLLOW_MAX_S = 300.0
+
+
+def _find_person(body: Body) -> tuple[Sighting | None, float]:
+    """Standing still, look for them with the head -- it stays pointed at them.
+    (the sighting, the head's pan)."""
+    for pan in SEARCH_PANS:
+        body.look(pan)
+        for _ in range(3):  # the detector misses a frame now and then
+            s = body.person()
+            if s is not None:
+                return s, pan
+            body.wait(0.15)
+    body.look(0)
+    return None, 0.0
+
+
+def _head_for(bearing: float, pan: float) -> float:
+    """Where the head should point to keep them in view while driving toward
+    them: straight ahead when they're roughly ahead, else turned their way in
+    20-degree steps -- with slack, so it doesn't flip-flop at a boundary."""
+    if pan == 0 and abs(bearing) <= SIDE_DEG or pan != 0 and abs(bearing) < SIDE_DEG - 10:
+        return 0.0
+    if pan != 0 and abs(bearing - pan) <= 20:
+        return pan
+    return max(-60.0, min(60.0, 20.0 * round(bearing / 20)))
+
+
+def follow(body: Body, max_s: float = FOLLOW_MAX_S) -> Outcome:
+    """"Follow me": stay near the person in view -- steer toward them, stop
+    when they're close, go again when they walk on. The head only turns while
+    the car stands still (the detector reports a frame ~0.1s old: a moving
+    head would put them in the wrong place), and points where _head_for says,
+    so a person off to the side stays in view while Rocky turns toward them.
+    Lost: stop and look around for them -- not there: call out and keep
+    looking a little while. The first floor edge ends it -- they
+    can step off a table, Rocky can't."""
+    moving, pan, last, seen, t, looks, stuck = False, 0.0, None, 0.0, 0.0, 0, 0
+    try:
+        while t < max_s:
+            _check_cancel(body)
+            if any(body.floor()):
+                return Outcome(False, "the floor ends here, so I stopped at the edge", looks)
+            if stuck > FOLLOW_MAX_TRIES:
+                return Outcome(False, "I can't get to you from here", looks)
+            s = body.person()
+            if s is not None:
+                last, seen = s, t
+            elif t - seen > FOLLOW_GRACE_S:  # gone: look for them, standing still
+                if moving:
+                    body.stop()
+                    moving = False
+                s, pan = _find_person(body)
+                if s is None:  # call out, and give them a moment to come back into view
+                    getattr(body, "say", lambda text: None)("Where did you go?")
+                    for _ in range(FOLLOW_SEEK_SWEEPS):
+                        _check_cancel(body)
+                        s, pan = _find_person(body)
+                        if s is not None:
+                            break
+                    else:
+                        return Outcome(False, "I lost sight of you", looks)
+                last, seen, looks, stuck = s, t, looks + 1, stuck + 1
+                continue
+            else:
+                s = last  # a missed frame or two: carry on as before (None at the very start: wait)
+            d = body.distance()
+            if s is None:
+                pass
+            elif d is not None and d < FOLLOW_STOP_CM and s.width < FOLLOW_SMALL_WIDTH:
+                return Outcome(False, "something is in my way", looks)
+            elif moving:
+                if s.width >= FOLLOW_CLOSE_WIDTH or (d is not None and d < FOLLOW_STOP_CM) \
+                        or _head_for(s.bearing, pan) != pan:
+                    body.stop()  # close enough -- or the head has to turn, which it only does standing still
+                    moving = False
+                else:
+                    body.set_steer(_clamp(s.bearing * STEER_GAIN))
+            elif s.width < FOLLOW_GO_WIDTH and (d is None or d > FOLLOW_GO_CM):  # they walked on
+                head = _head_for(s.bearing, pan)
+                if head != pan:
+                    body.look(head)
+                    pan, last, looks, stuck = head, None, looks + 1, stuck + 1
+                    seen = t - FOLLOW_GRACE_S  # that sighting was through the old view
+                    continue
+                body.start_drive(FOLLOW_SPEED, _clamp(s.bearing * STEER_GAIN))
+                moving, stuck = True, 0
+            result = body.wait(CTRL_TICK)
+            t += CTRL_TICK
+            if result != "ok":
+                raise Stop(result)
+        return Outcome(True, "followed you as long as I'm allowed to in one go", looks)
+    except Stop as e:
+        return Outcome(False, str(e), looks)
+    finally:
+        body.stop()

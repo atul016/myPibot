@@ -1,0 +1,67 @@
+{
+ "description": "Follow me around: the person walks round to Rocky's left side and waits there, out of his camera's view. He has to find them with his head, turn toward them and end near them -- without bumping them on the way round.",
+ "table": [
+  0,
+  0,
+  300,
+  250
+ ],
+ "robot": [
+  60,
+  100,
+  0
+ ],
+ "obstacles": [
+  {
+   "shape": "rect",
+   "x": 0,
+   "y": 0,
+   "w": 300,
+   "h": 4
+  },
+  {
+   "shape": "rect",
+   "x": 0,
+   "y": 246,
+   "w": 300,
+   "h": 4
+  },
+  {
+   "shape": "rect",
+   "x": 0,
+   "y": 0,
+   "w": 4,
+   "h": 250
+  },
+  {
+   "shape": "rect",
+   "x": 296,
+   "y": 0,
+   "w": 4,
+   "h": 250
+  },
+  {
+   "shape": "circle",
+   "x": 150,
+   "y": 100,
+   "r": 15,
+   "label": "person",
+   "walk": [
+    [
+     140,
+     180
+    ],
+    [
+     70,
+     215
+    ]
+   ],
+   "speed": 12,
+   "wait": 2
+  }
+ ],
+ "task": {
+  "follow": 60
+ },
+ "expect": "reach"
+}

@@ -20,6 +20,7 @@ from movement import navigate
 from sim.world import FRONT_REACH, SimBody, World
 
 TRUE_ARRIVAL_CM = 35  # a "reached it" must end with the bumper this close to the target's centre
+FOLLOW_NEAR_CM = 120  # a follow that ran its course must end with the bumper this close to the person's centre
 
 SEEDS = 25
 MIN_REACH = 0.9  # "reach" scenarios: at least this share of seeds must get there
@@ -33,6 +34,8 @@ def run(path: Path, seed: int):
     task = spec["task"]
     if "approach" in task:
         outcome = navigate.approach(body, task["approach"])
+    elif "follow" in task:
+        outcome = navigate.follow(body, task["follow"])
     else:
         outcome = navigate.explore(body, task["explore"], rng=random.Random(seed))
     return world, spec, outcome
@@ -57,6 +60,11 @@ def main(names: list[str]) -> None:
                 target = next(o for o in world.obstacles if o.label and spec["task"]["approach"] in o.label)
                 fx, fy = world.pose.point(FRONT_REACH)
                 false_claims += math.hypot(fx - target.center()[0], fy - target.center()[1]) > TRUE_ARRIVAL_CM
+            if outcome.done and "follow" in spec["task"]:
+                world.walk()
+                person = next(o for o in world.obstacles if o.label == "person")
+                fx, fy = world.pose.point(FRONT_REACH)
+                false_claims += math.hypot(fx - person.x, fy - person.y) > FOLLOW_NEAR_CM
             reasons[outcome.reason] = reasons.get(outcome.reason, 0) + 1
             steps.append(outcome.steps)
             if seed == 0:

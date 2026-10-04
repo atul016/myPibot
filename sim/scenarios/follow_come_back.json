@@ -1,0 +1,88 @@
+{
+ "description": "Follow me, then step away: the person stands close in front (Rocky waits), walks round behind him where his head can't look, stands there 2s, comes back round and walks off ahead. He has to call out and keep looking instead of giving up -- and then follow them.",
+ "table": [
+  0,
+  0,
+  300,
+  250
+ ],
+ "robot": [
+  120,
+  125,
+  0
+ ],
+ "obstacles": [
+  {
+   "shape": "rect",
+   "x": 0,
+   "y": 0,
+   "w": 300,
+   "h": 4
+  },
+  {
+   "shape": "rect",
+   "x": 0,
+   "y": 246,
+   "w": 300,
+   "h": 4
+  },
+  {
+   "shape": "rect",
+   "x": 0,
+   "y": 0,
+   "w": 4,
+   "h": 250
+  },
+  {
+   "shape": "rect",
+   "x": 296,
+   "y": 0,
+   "w": 4,
+   "h": 250
+  },
+  {
+   "shape": "circle",
+   "x": 190,
+   "y": 125,
+   "r": 15,
+   "label": "person",
+   "walk": [
+    [
+     150,
+     190
+    ],
+    [
+     90,
+     190
+    ],
+    [
+     60,
+     140,
+     2
+    ],
+    [
+     90,
+     190
+    ],
+    [
+     150,
+     190
+    ],
+    [
+     190,
+     140
+    ],
+    [
+     260,
+     130
+    ]
+   ],
+   "speed": 25,
+   "wait": 3
+  }
+ ],
+ "task": {
+  "follow": 60
+ },
+ "expect": "reach"
+}

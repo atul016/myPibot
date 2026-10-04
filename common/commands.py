@@ -5,7 +5,7 @@
     "go to sleep"      -> everything off but the voice listener (and the nightly
                          memory review); ONLY "Rocky, wake up" wakes it
     "louder" / "softer" -> speaker volume
-    "go to the <thing>" / "come here" / "explore" / "stop" -> driving (navigation())
+    "go to the <thing>" / "come here" / "follow me" / "explore" / "stop" -> driving (navigation())
 
 Short, plain phrases on purpose (the main user prefers simple words). The
 whole utterance must BE the command (after dropping "rocky"/"please"/
@@ -65,6 +65,8 @@ _GO_TO = re.compile(r"^(?:please )?(?:head|(?:(?:go|drive|move|roll) )*(?:go|dri
                     r"to(?:wards?)? (?:the |that |my |a |your )?(.+?)(?: please)?$")
 _COME = {"come here", "come to me", "come over here", "come over", "come", "come here please", "come closer",
          "come back", "come back here"}
+_FOLLOW = {"follow me", "follow", "follow me please", "come with me", "follow me around", "keep following me",
+           "walk with me", "start following me"}
 _EXPLORE = {"explore", "explore the room", "explore around", "go explore", "explore the table", "go exploring",
             "explore a bit", "look around the room"}
 _STOP = {"stop", "stop moving", "stop driving", "halt", "freeze", "stop it", "stop stop", "wait", "hold on",
@@ -72,8 +74,8 @@ _STOP = {"stop", "stop moving", "stop driving", "halt", "freeze", "stop it", "st
 
 
 def navigation(text: str) -> tuple[str, str | None] | None:
-    """A driving request: ("approach", thing) / ("explore", None) / ("stop", None),
-    or None. "come here" drives to the person ("person" is what the camera
+    """A driving request: ("approach", thing) / ("follow", None) / ("explore", None) /
+    ("stop", None), or None. "come here" drives to the person ("person" is what the camera
     looks for)."""
     if parse(text):  # "go to sleep" is a mode command, not a place to drive to
         return None
@@ -82,6 +84,8 @@ def navigation(text: str) -> tuple[str, str | None] | None:
         return "stop", None
     if t in _COME:
         return "approach", "person"
+    if t in _FOLLOW:
+        return "follow", None
     if t in _EXPLORE:
         return "explore", None
     m = _GO_TO.match(t)
@@ -111,6 +115,8 @@ def demo() -> None:
     assert navigation("Come here!") == ("approach", "person") and navigation("explore the room") == ("explore", None)
     assert navigation("Stop!") == ("stop", None) and navigation(f"{n}, stop moving") == ("stop", None)
     assert navigation("I want to go to the store and buy some milk") is None
+    assert navigation(f"{n}, follow me.") == ("follow", None) and navigation("Come with me!") == ("follow", None)
+    assert navigation("Don't follow me") is None and navigation("I follow the news") is None
     assert navigation("What is this?") is None and parse("stop") is None  # bare "stop" isn't "stop session"
     assert navigation("Go to sleep.") is None and navigation(f"{n}, go to sleep") is None  # mode command wins
 

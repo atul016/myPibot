@@ -9,8 +9,8 @@ Serve, llama.cpp...), so nothing goes to a cloud.
 **You don't need a robot car.** OpenBot runs on any Linux computer (a
 Raspberry Pi is ideal) with a microphone and a speaker. A camera is
 optional. With a [SunFounder PiCar-X](https://docs.sunfounder.com/projects/picar-x-v20/en/latest/)
-it also gestures, drives to things ("go to the pink toy"), explores, and
-backs away from table edges. Other robots can be added (see
+it also gestures, drives to things ("go to the pink toy"), follows you
+("follow me"), explores, and backs away from table edges. Other robots can be added (see
 [Adding your own robot](#adding-your-own-robot)).
 
 The bot's identity is a **persona**: name, wake word, personality and
@@ -77,7 +77,7 @@ request per connection:
 | Request | Reply | Meaning |
 |---|---|---|
 | `{"actions": ["nod", "look left"], "wait": true}` | `{"ok": true}` | do these gestures in order (`wait`: reply when done) |
-| `{"navigate": {"approach": "pink toy"}}` / `{"navigate": {"explore": 60}}` | `{"ok": true}` or `{"ok": false, "error": "..."}` | start a drive |
+| `{"navigate": {"approach": "pink toy"}}` / `{"navigate": {"follow": true}}` / `{"navigate": {"explore": 60}}` | `{"ok": true}` or `{"ok": false, "error": "..."}` | start a drive |
 | `{"navigate_cancel": true}` | `{"ok": true, "was_driving": bool}` | stop driving now |
 
 Then, in `config.py`, add your body name next to `picarx`: its gesture names
@@ -192,7 +192,9 @@ auth, and its ~1235-test suite.
   to itself.
 - **Camera** (`services/camera.py`, `openbot-camera`) -- the camera's sole owner: `rpicam-vid`
   MJPEG at ~10fps (NoIR tuning), served on :9000 (`/mjpg`, `/snapshot.jpg`) and relayed live
-  in the dashboard's Camera tab. Everyone else asks it for frames.
+  in the dashboard's Camera tab, with the object detector's boxes drawn over it. Everyone else
+  asks it for frames. The detector (`common/objects.py`) runs every 2s, or on every frame
+  (~9/s on a Pi 5) while someone calls `objects.want_fast()` -- the Camera tab, or following.
 - **Eyes** (`common/vision.py`) -- a frame from openbot-camera (fallback: one-shot `rpicam-still`; never vilib) every
   `VISION_INTERVAL_S` -> the vision LLM describes the scene and says what
   changed since the last look that way. Frames darker than `DARK_BRIGHTNESS`
@@ -339,6 +341,17 @@ hidden or off-the-table targets refused 25/25; exploring a room floor -- 0 falls
 a soft bump in ~40% of ~3-minute runs (things beside the path). The physical
 numbers in `sim/world.py` are calibration knobs to measure on the real car.
 
+**Following** (`navigate.follow`, "follow me"): the object detector's person boxes,
+~9/s, with the head tipped up 30 degrees (measured: then box width tracks distance).
+Steer toward them, stop ~0.6m away (box width or the ultrasonic), go again when they
+walk on. The head only turns while the car stands still -- a detection is ~0.1s old,
+so a moving head would put them in the wrong place -- and turns their way when they're
+off to the side, so Rocky can turn after them. Lost: look around with the head; still
+nothing: say "Where did you go?" and keep looking ~10s. The first floor edge ends it.
+In the sim, with a walking person (waypoints, pauses, missed detections): across a
+room 25/25, round to his side 25/25, behind him and back 24/25 (0/25 without the
+keep-looking), past a desk edge -- stops at the edge 25/25; 0 falls, 0 bumps.
+
 ## Voice commands (`common/commands.py`)
 
 Say the persona's name ("Rocky") to start a conversation. It stays open -- pauses and silence never
@@ -349,6 +362,7 @@ end it -- until one of:
 | **be quiet** / "Rocky, quiet" / stop session | ends the conversation. Rocky stays awake in the background -- watching, thinking, following faces -- and may still speak up on its own. "Rocky" starts a new one. |
 | **go to sleep** | everything off except the voice listener: camera, thinking, face-following, sensors and reflexes (cliff safety too), head down. Only the nightly memory review still runs. **Only "Rocky, wake up" wakes it** -- plain "Rocky" is ignored while asleep. Waking alone just brings it back to awake-in-the-background (one sleepy word, no conversation); "Rocky, wake up, what time is it" wakes it and answers. |
 | **louder** / **softer** | speaker volume (15% steps; remembered across reboots) |
+| **go to the <thing>** / **come here** / **follow me** / **explore** / **stop** | drive (PiCar-X; see Driving). Only these exact phrases drive -- texts never do. |
 
 Commands also work said over Rocky while it's talking. The mind pauses only
 while someone's actually talking (`state.conversation_active`: speech in the

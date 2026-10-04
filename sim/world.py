@@ -59,6 +59,17 @@ class Obstacle:
     w: float = 0.0             # rect (x, y = lower-left corner)
     h: float = 0.0
     label: str | None = None   # what the camera calls it; None = an unremarkable thing
+    # A walking person (circle): from (x, y) to each waypoint in turn at `speed` cm/s,
+    # starting after `wait` s; a waypoint [x, y, s] stands there s seconds. A
+    # collision counts only when Rocky moves into it.
+    walk: list | None = None
+    speed: float = 0.0
+    wait: float = 0.0
+    start: tuple | None = None
+
+    def __post_init__(self) -> None:
+        if self.walk and self.start is None:
+            self.start = (self.x, self.y)
 
     def center(self) -> tuple[float, float]:
         return (self.x, self.y) if self.shape == "circle" else (self.x + self.w / 2, self.y + self.h / 2)
@@ -141,7 +152,26 @@ class World:
         p = pose or self.pose
         return [p.point(a, s * HALF_TRACK) for a in (0.0, WHEELBASE) for s in (-1, 1)]
 
+    def walk(self) -> None:
+        """Move the walking people to where they are at self.time."""
+        for o in self.obstacles:
+            if not o.walk:
+                continue
+            t, (ax, ay) = self.time - o.wait, o.start
+            o.x, o.y = ax, ay
+            for bx, by, *pause in o.walk:
+                need = math.hypot(bx - ax, by - ay) / o.speed
+                if t < need:
+                    f = max(0.0, t) / need if need else 0.0
+                    o.x, o.y = ax + (bx - ax) * f, ay + (by - ay) * f
+                    break
+                o.x, o.y = ax, ay = bx, by
+                t -= need + (pause[0] if pause else 0.0)
+                if t < 0:
+                    break
+
     def collides(self, pose: Pose) -> Obstacle | None:
+        self.walk()
         for ahead, r in BODY_CIRCLES:
             cx, cy = pose.point(ahead)
             for o in self.obstacles:
@@ -172,6 +202,7 @@ class World:
     # --- sensors --------------------------------------------------------------------
     def ultrasonic(self) -> float:
         """Like the real sensor: cm, or -2 for no echo (nothing in range, or a glitch)."""
+        self.walk()
         ox, oy = self.pose.point(FRONT_REACH)
         best = None
         for deg in ULTRASONIC_RAYS:
@@ -191,6 +222,7 @@ class World:
     def visible(self) -> list[tuple[Obstacle, float, float]]:
         """Labelled objects in the camera's view: (object, bearing in degrees from
         the BODY's heading, + = left; angular width as a fraction of the FOV)."""
+        self.walk()
         cx, cy = self.pose.point(FRONT_REACH - 4)
         axis = self.pose.h + math.radians(self.pan)
         out = []
@@ -236,6 +268,11 @@ class World:
                  f'<rect x="{x0}" y="{y0}" width="{W}" height="{H + 18}" fill="#f4f1ea"/>',
                  f'<rect x="{tx}" y="{fy(ty + th)}" width="{tw}" height="{th}" fill="#d9c7a3" stroke="#8a7350"/>']
         for o in self.obstacles:
+            if o.walk:
+                pts = " ".join(f"{x:.1f},{fy(y):.1f}" for x, y, *_ in [o.start, *o.walk])
+                parts.append(f'<polyline points="{pts}" fill="none" stroke="#e05a8a" stroke-dasharray="2,2" '
+                             'stroke-width="0.8"/>')
+        for o in self.obstacles:
             fill = "#e05a8a" if o.label else "#888"
             cx, cy = o.center()
             if o.shape == "circle":
@@ -261,6 +298,7 @@ class World:
 
 VLM_SECONDS = 0.5      # the Mac's vision model, per look -- the robot stands still meanwhile
 TRACKER_NOISE = 1.0    # degrees: the fast video tracker's jitter
+PERSON_MISS = 0.15     # the object detector misses a person in this share of frames
 
 
 class SimBody:
@@ -304,6 +342,10 @@ class SimBody:
         if s is not None:
             s.bearing += self.w.rng.gauss(0, TRACKER_NOISE)
         return s
+
+    def person(self):
+        """The object detector's newest person (~8/s on the real Pi): noisy, sometimes missed."""
+        return None if self.w.rng.random() < PERSON_MISS else self.track("person")
 
     def distance(self) -> float | None:
         d = self.w.ultrasonic()
