@@ -31,6 +31,9 @@ HAS_BODY = BODY != "none"
 CAN_DRIVE = BODY == "picarx"     # "go to the X" / "explore" / forward/back/turn
 LOOK_DIRECTIONS = sorted(LOOK_ANGLES)  # the mind's `look` tool; just "ahead" without a head to turn
 SOUNDS = ["honking", "start engine"] if BODY == "picarx" else []
+# The IMU's axes that point forward, right and down, as mounted (common/imu.py): "+x,+y,+z" is
+# the DFRobot board flat with its X arrow forward. No IMU on the bus: no heading or tilt.
+IMU_AXES = os.environ.get("OPENBOT_IMU_AXES", "+x,+y,+z")
 
 # --- LLM: any OpenAI-compatible /v1 server (MLX Serve, Ollama, llama.cpp...) ---
 # Default is a local Ollama. A bigger model on another machine: point this at
@@ -94,7 +97,7 @@ def describe_actions(names: list[str]) -> str:
     return "; ".join(f"{n} ({GESTURE_GUIDE[n]})" if GESTURE_GUIDE.get(n) else n for n in names)
 
 # --- Sessions -------------------------------------------------------------
-# A session lasts until "stop session" / "go to sleep" (common/commands.py).
+# A session lasts until they ask it to stop (skills end_conversation, sleep).
 # Talk over Rocky ("stop", "wait", "hold on") to cut it off mid-reply.
 # Untested against live echo -- set OPENBOT_BARGE_IN=0 if Rocky keeps
 # interrupting itself through its own speaker.

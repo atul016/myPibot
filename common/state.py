@@ -11,7 +11,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from filelock import FileLock, Timeout as FileLockTimeout
 
@@ -30,7 +30,7 @@ DEFAULT_SESSION: dict[str, Any] = {
     "mood": "neutral",
     "confirm_motion_allowed": True,
     "asleep": False,  # "go to sleep": camera off, no thinking, no moving -- the wake word wakes it
-    "remote_command": None,  # a mode skill used by text (sleep, wake_up...), for wake-listen to carry out
+    "remote_command": None,  # {"skill": sleep|end_conversation|volume|wake_up, ...} used by text: wake-listen does it
     "text_out": None,  # a WhatsApp text the mind decided on, for openbot-chat to send
     "texts_paused_until": {},  # number ("*": everyone) -> unix time: don't text them first till then (skills/pause_texting)
 }
@@ -97,15 +97,27 @@ def load_session() -> dict[str, Any]:
         return {}
 
 
-def update_session(fields: dict[str, Any]) -> None:
+def _change(edit: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
     with FileLock(str(LOCK_PATH), timeout=LOCK_TIMEOUT_S):
         ensure_session()
         try:
             data = json.loads(SESSION_PATH.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             data = dict(DEFAULT_SESSION)
-        data.update(fields)
+        edit(data)
         atomic_write(SESSION_PATH, json.dumps(data, indent=2))
+        return data
+
+
+def update_session(fields: dict[str, Any]) -> None:
+    _change(lambda data: data.update(fields))
+
+
+def change_session(key: str, change: Callable[[Any], Any]) -> Any:
+    """Read, change and write one value under a single lock -- for a list several services
+    change at once (the reminders: load + update would lose one of two changes made together).
+    `change` must not touch the session itself: a second lock in here would wait out the timeout."""
+    return _change(lambda data: data.__setitem__(key, change(data.get(key))))[key]
 
 
 def conversation_active(session: dict | None = None) -> bool:
@@ -143,6 +155,8 @@ def demo() -> None:
         assert load_session() == DEFAULT_SESSION
         update_session({"persona": "test"})
         assert load_session()["persona"] == "test"
+        assert change_session("todo", lambda v: (v or []) + ["milk"]) == ["milk"]
+        assert change_session("todo", lambda v: v + ["eggs"]) == ["milk", "eggs"] == load_session()["todo"]
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)
 

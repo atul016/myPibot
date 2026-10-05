@@ -8,13 +8,14 @@
                 else on a slow idle timer unless resting. The LLM sees what
                 changed, its day so far, its recent life (journal tail), its
                 goals, reminders and watches, and memories recalled for the
-                moment -- then picks one action. TOOLS (look, listen, recall)
+                moment -- then picks one action. Its tools (look, listen, recall)
                 feed their result back and it decides again, up to
                 MIND_MAX_STEPS; a surprise arriving mid-chain is handed to
                 the next step instead of waiting for the chain to end.
-  expression -- speak/gesture/sound/remember/remind_me/watch/rest through a
-                whitelist + param validation (SPARK's validate_action shape),
-                gated by policy (asleep) and an anti-flap cooldown.
+  expression -- its skills (skills/*/ with `where: mind`): one spec each --
+                the prompt's list, the schema's choices, Jev's options and
+                the checking all come from it -- gated by policy (asleep)
+                and, for audio and motion, an anti-flap cooldown.
   texting    -- after each reflection, with WhatsApp set up: the decision
                 engine (Jev), not the LLM or a rule, decides whether the
                 moment is worth texting its person; the LLM then writes it
@@ -23,10 +24,9 @@
                 and once a day (first thing after midnight) a "dream"
                 pass that distills yesterday's journal into notes by kind.
 
-The wheels: `look` turns only the camera gimbal; the only wheel moves the
-mind may choose are config.PLAYFUL_ACTIONS -- the body's short, bounded,
-cliff-checked playful moves -- as gestures. Driving anywhere is a spoken
-command, never a reflection.
+The wheels: `look` turns only the camera gimbal; the mind's wheel moves are
+config.PLAYFUL_ACTIONS as gestures (short, bounded, cliff-checked) and
+drive_to / explore -- never in the dark.
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ from typing import Any, Callable
 
 import config as cfg  # noqa: E402
 from common import agenda, cognition, contacts, decider, events as dash_events, faces, health, journal, memory  # noqa: E402
-from common import hearing, objects, outcomes, tools  # noqa: E402
+from common import hearing, imu, objects, outcomes, skills, tools  # noqa: E402
 from common import persona as persona_mod, policy, react, sensors, state, surprise, vision  # noqa: E402
 from common.motor_client import dispatch as motor_dispatch  # noqa: E402
 from common.speak_client import speak as speak_client  # noqa: E402
@@ -49,34 +49,9 @@ from common.speak_client import speak as speak_client  # noqa: E402
 COMPONENT = "openbot-mind"
 # openbot-memory isn't listed: it's Basic Memory itself, which doesn't write our health records.
 HEALTH_COMPONENTS = ["openbot-alive"] * cfg.HAS_BODY + ["openbot-ears", "openbot-wake-listen", "openbot-mind",
-                                                        "openbot-speak"]
+                                                        "openbot-speak", "openbot-tasks"]
 
-ALLOWED_EXPRESSIONS = {"speak", "gesture", "wait", "remember", "play_sound", "time_check", "introspect",
-                       "remind_me", "watch", "rest", "wish", "sleep", "go_to", "explore"}
-if not cfg.CAN_DRIVE:
-    ALLOWED_EXPRESSIONS -= {"go_to", "explore"}
-EXPLORE_S = (10, 120)
 INVITE_S = 20.0  # after the mind speaks, wake-listen listens this long for an answer -- no wake word needed
-# Observe-only actions: their result goes back to the LLM for another step.
-TOOLS = {"look", "listen", "recall"}
-if not cfg.STATIONARY_ACTIONS:  # no body: nothing to gesture with
-    ALLOWED_EXPRESSIONS.discard("gesture")
-if not cfg.SOUNDS:
-    ALLOWED_EXPRESSIONS.discard("play_sound")
-# Without a body nothing reports distance, being picked up, or the battery.
-WATCHABLE = agenda.WATCHABLE if cfg.HAS_BODY else \
-    agenda.WATCHABLE - {"approach", "leave", "picked_up", "put_down", "battery_low"}
-LISTEN_S = 5.0
-EXPRESSION_EFFECT = {
-    "speak": "audio", "gesture": "presence", "play_sound": "audio", "time_check": "audio", "introspect": "audio",
-    "go_to": "motion", "explore": "motion", "sleep": "presence",
-}  # everything else is silent bookkeeping ("other")
-# Silent bookkeeping isn't an expressive act -- exempt from the cooldown.
-COOLDOWN_EXEMPT = {"wait", "remember", "remind_me", "watch", "rest", "wish", "sleep",
-                   # A gesture is the model's call, whenever it likes: nothing else moves the body
-                   # when nobody's talking to it (no canned fidgets) -- only speech is throttled.
-                   "gesture"}
-ALLOWED_SOUNDS = set(cfg.SOUNDS)
 
 Event = surprise.Event
 
@@ -86,83 +61,34 @@ class MindError(Exception):
     nothing this cycle," never as a reason to crash the loop."""
 
 
-def _text(params: dict, key: str, limit: int) -> str:
-    text = memory.one_line(params.get(key, ""), limit + 1)
-    if not text or len(text) > limit:
-        raise MindError(f"{key} requires 1-{limit} chars")
-    return text
+def _skills() -> dict[str, skills.Skill]:
+    """What the mind can do: the skills with `where: mind` this body has -- read fresh, so an
+    edited skills/*/*.md counts from the next thought."""
+    return {s.name: s for s in skills.available("mind", cfg.CAN_DRIVE, skills.load())}
 
 
-def _minutes(params: dict, key: str) -> int:
-    try:
-        m = int(params.get(key))
-    except (TypeError, ValueError):
-        raise MindError(f"{key} must be a whole number of minutes")
-    if not 1 <= m <= agenda.REMIND_MINUTES[1]:
-        raise MindError(f"{key} must be 1-{agenda.REMIND_MINUTES[1]}")
-    return m
-
-
-def validate_expression(action: dict, stationary_actions: list[str]) -> tuple[str, dict]:
-    name = action.get("action")
-    if name not in ALLOWED_EXPRESSIONS | TOOLS:
+def validate_expression(action: Any, book: dict[str, skills.Skill] | None = None) -> tuple[str, dict]:
+    """The reflection's {"action", "params"}, held to that skill's spec (skills.check) and to
+    the mind's own restraint: never drive in the dark; sleep only when tired, with nobody in view.
+    MindError when it doesn't fit -- the reflection then does nothing."""
+    book = book or _skills()
+    name = action.get("action") if isinstance(action, dict) else None
+    if name not in book:
         raise MindError(f"unsupported mind expression: {name!r}")
-    params = action.get("params") or {}
-    if name == "look":
-        direction = str(params.get("direction", "ahead"))
-        if direction not in cfg.LOOK_DIRECTIONS:
-            raise MindError(f"look direction must be one of {cfg.LOOK_DIRECTIONS}")
-        return name, {"direction": direction}
-    if name == "recall":
-        return name, {"query": _text(params, "query", 200)}
-    if name == "speak":
-        return name, {"text": _text(params, "text", 300)}
-    if name == "gesture":
-        gesture = str(params.get("name", ""))
-        if gesture not in stationary_actions and gesture not in cfg.PLAYFUL_ACTIONS:
-            raise MindError(f"unknown gesture: {gesture!r}")
-        return name, {"name": gesture}
-    if name == "remember":
-        kind = str(params.get("kind", ""))
-        if kind not in memory.KINDS:
-            raise MindError(f"remember kind must be one of {sorted(memory.KINDS)}")
-        return name, {"kind": kind, "about": _text(params, "about", 60),
-                      "category": memory.slug(str(params.get("category", "note")))[:20] or "note",
-                      "text": _text(params, "text", 300)}
-    if name == "play_sound":
-        sound = str(params.get("name", ""))
-        if sound not in ALLOWED_SOUNDS:
-            raise MindError(f"unknown sound: {sound!r}; allowed: {sorted(ALLOWED_SOUNDS)}")
-        return name, {"name": sound}
-    if name == "remind_me":
-        return name, {"in_minutes": _minutes(params, "in_minutes"), "about": _text(params, "about", 200)}
-    if name == "watch":
-        kind = str(params.get("for", ""))
-        if kind not in WATCHABLE:
-            raise MindError(f"watch 'for' must be one of {sorted(WATCHABLE)}")
-        return name, {"for": kind, "about": _text(params, "about", 200)}
-    if name == "rest":
-        return name, {"minutes": _minutes(params, "minutes")}
-    if name == "wish":
-        return name, {"text": _text(params, "text", 200)}
-    if name in ("go_to", "explore"):
-        if vision.last_look().get("scene") == vision.DARK_SCENE:
-            raise MindError("too dark to drive")
-        if name == "go_to":
-            return name, {"target": _text(params, "target", 40)}
-        try:
-            secs = int(params.get("seconds", 30))
-        except (TypeError, ValueError):
-            raise MindError("seconds must be a whole number")
-        return name, {"seconds": max(EXPLORE_S[0], min(EXPLORE_S[1], secs))}
+    params = action.get("params")
+    try:
+        params = skills.check(book[name], params if isinstance(params, dict) else {}).model_dump()
+    except ValueError as e:
+        raise MindError(f"{name}: {e}") from None
+    del params["skill"]
+    if book[name].effect == "motion" and vision.last_look().get("scene") == vision.DARK_SCENE:
+        raise MindError("too dark to drive")
     if name == "sleep":
         if not any(n.startswith(("dark", "tired")) for n in _needs()):
             raise MindError("not tired: sleep only when it's dark and quiet or the battery is low")
         if faces.read().get("faces"):
             raise MindError("someone is right in front of you -- not a time to sleep")
-        return name, {}
-    # time_check, introspect, wait, listen -- no params
-    return name, {}
+    return name, params
 
 
 def _ago(ts: float | None) -> str | None:
@@ -198,7 +124,10 @@ def _build_awareness(events: list[Event], watch_hits: list[dict]) -> dict[str, A
         "what_you_see": {"scene": look.get("scene"), "looked": _ago(look.get("ts"))} if look else None,
         "where_your_head_points": vision.head_words(head["pan"], head["tilt"]) if head else None,
         "which_way_you_face": vision.facing_words(),
-        "you_were_moved": f"{session['moved_how']} {_ago(session['moved_ts'])} -- you may face another way now"
+        "your_posture": imu.posture_words(s["imu"]) if (s.get("imu") or {}).get("ts", 0) > time.time() - 3 else None,
+        "you_were_moved": f"{session['moved_how']} {_ago(session['moved_ts'])} -- " + (
+            "you felt it, so you know which way you face" if session["moved_how"].startswith("turned")
+            else "you may face another way now")
                           if time.time() - session.get("moved_ts", 0) < 1800 else None,
         "who_is_in_front_of_you": faces.describe(faces.read()) or "nobody",
         "things_in_view": objects.names(objects.read()),
@@ -208,7 +137,8 @@ def _build_awareness(events: list[Event], watch_hits: list[dict]) -> dict[str, A
         "your_day_so_far": journal.read_summary(datetime.date.today()) or None,
         "your_recent_life": journal.tail(15),
         "your_goals": [f"{i}. {g['text']} (since {g['since']})" for i, g in enumerate(goals, 1)] or None,
-        "reminders_you_set": [f"at {_in(r['at'])}: {r['about']}" for r in reminders] or None,
+        "reminders_you_set": [f"at {_in(r['at'])}: {r['about']}" for r in reminders
+                              if r.get("to", "mind") == "mind"] or None,
         "watching_for": [f"{w['for']}: {w['about']}" for w in watches if w["until"] > time.time()] or None,
         "resting_until": _in(rest_until) if rest_until > time.time() else None,
         "memories_that_might_be_relevant": (memory.recall(query) or None) if query else None,
@@ -255,25 +185,6 @@ def _last_seen() -> dict[str, str]:
     return {name: _ago(ts) for name, ts in sorted(seen.items(), key=lambda kv: -kv[1])[:4] if _ago(ts)}
 
 
-ACTION_HINTS = {
-    "speak": "say a short line out loud, only when something genuinely worth saying happened",
-    "gesture": "make a small stationary body movement, e.g. when something nearby changed",
-    "remember": "store a durable fact about a person, place, lesson or yourself",
-    "play_sound": "play a sound effect",
-    "time_check": "comment on the current time",
-    "introspect": "check on own health or battery, when battery is low or a component is failing",
-    "look": "look through the camera and see what's there -- a tool, you decide again after",
-    "listen": "listen to the room for a few seconds -- a tool, you decide again after",
-    "recall": "search your memories and journal -- a tool, you decide again after",
-    "remind_me": "set yourself a reminder for later, and rest until then",
-    "watch": "ask to be told when a specific kind of change happens",
-    "rest": "stop idle thinking for a while when nothing will change; surprises still wake you",
-    "wait": "do nothing this cycle; the correct choice when nothing notable is happening",
-    "wish": "write down something you wish you could do or have -- your developer reads these",
-    "sleep": "go to sleep for the night when it's dark and quiet, or you're very low on battery",
-    "go_to": "drive to something you can see, to look at it up close",
-    "explore": "drive around for a while to see what's there",
-}
 _decide = decider.load(cfg.DECIDER)
 # Texting first: the engine decides whether a moment is worth a WhatsApp text (not the LLM, not a rule).
 _text_decider = decider.load(cfg.TEXT_DECIDER) if cfg.CHAT_ALLOW else None
@@ -287,12 +198,12 @@ _TEXT_SCHEMA = {"type": "object", "properties": {"text": {"type": "string"}, "ph
 _texting = threading.Lock()  # one decision at a time -- a slow engine never stalls the mind loop
 
 
-def _decided_action(awareness: dict) -> str | None:
+def _decided_action(awareness: dict, book: dict[str, skills.Skill]) -> str | None:
     """The decision engine's pick, or None if there's no engine / it can't
     decide (the LLM then chooses). Not confident -> "wait"."""
     if not _decide:
         return None
-    hints = {k: v for k, v in ACTION_HINTS.items() if k in ALLOWED_EXPRESSIONS | TOOLS}
+    hints = {name: s.description for name, s in book.items()}
     d = _decide(awareness, "What should a small desk robot do this moment, given its state?", hints)
     if not d:
         return None
@@ -320,8 +231,7 @@ def _reflection_schema(actions: list[str]) -> dict:
 
 
 def _reflection_prompt(persona, awareness: dict, steps: list[str], final_step: bool,
-                       decided: str | None = None) -> str:
-    gestures = cfg.describe_actions(cfg.STATIONARY_ACTIONS)
+                       book: dict[str, skills.Skill], decided: str | None = None) -> str:
     parts = [
         f"You are {persona.name}'s private stream of consciousness -- a small robot on a desk, "
         "alive and curious about the world around you. Nobody is talking to you right now. "
@@ -355,31 +265,8 @@ def _reflection_prompt(persona, awareness: dict, steps: list[str], final_step: b
         "- if_a_hand_reaches_out_gesture / if_a_hand_reaches_out_say: decide NOW, in your current mood, what "
         "you'd do and say if someone holds a hand or fist out to you in the next few minutes -- so you can "
         "react instantly. A gesture (any of the above, including the wheel ones) and a word or two (or \"\").\n"
-        "- action + params, one of:\n"
-        f"  look {{\"direction\": {'|'.join(d for d in cfg.LOOK_DIRECTIONS if d != 'down')}}}  -- TOOL: see what's there, then decide again\n"
-        "  listen {}  -- TOOL: hear the room for a few seconds, then decide again\n"
-        "  recall {\"query\": ...}  -- TOOL: search your memories and journal, then decide again\n"
-        "  speak {\"text\": ...}  -- say a short line out loud, in character, <=300 chars\n" +
-        (f"  gesture {{\"name\": one of: {gestures}" + (f"; or, on the wheels, when it fits: "
-         f"{cfg.describe_actions(cfg.PLAYFUL_ACTIONS)}" if cfg.PLAYFUL_ACTIONS else "")
-         + "}\n" if "gesture" in ALLOWED_EXPRESSIONS else "") +
-        "  remember {\"kind\": person|place|lesson|self, \"about\": who/what (e.g. \"Sam\", \"desk\"), "
-        "\"category\": one word (routine, preference, fact, habit...), \"text\": ...}  -- a durable fact\n"
-        "  remind_me {\"in_minutes\": 1-720, \"about\": ...}  -- wake yourself later with this on your "
-        "mind; you rest until then (surprises still wake you)\n"
-        f"  watch {{\"for\": one of {sorted(WATCHABLE)}, \"about\": why you care}}\n"
-        "  rest {\"minutes\": 1-720}  -- stop idle thinking when nothing will change for a while\n"
-        "  wish {\"text\": ...}  -- something you wish you could do or have; your developer reads these\n"
-        "  sleep {}  -- for the night: everything off until someone says your name and \"wake up\". Only when "
-        "it's dark and quiet with nobody around, or you're very low on battery\n" +
-        ("  go_to {\"target\": a thing you can see, e.g. \"pink toy\", \"person\"}  -- drive to it and look up "
-         "close (on the table it stops at the edge; never in the dark)\n"
-         f"  explore {{\"seconds\": {EXPLORE_S[0]}-{EXPLORE_S[1]}}}  -- drive around to see what's there\n"
-         if "go_to" in ALLOWED_EXPRESSIONS else "") +
-        (f"  play_sound {{\"name\": one of {sorted(ALLOWED_SOUNDS)}}}\n" if ALLOWED_SOUNDS else "") +
-        "  time_check {}  /  introspect {} (own health/battery)\n"
-        "  wait {}  -- do nothing; fine when nothing is worth doing, but if you've been waiting "
-        "with nothing changing, rest or remind_me instead\n",
+        "- action + params, one of (a TOOL shows you what it finds, then you decide again):\n"
+        + skills.mind_menu(list(book.values())) + "\n",
         f"Current state:\n{json.dumps(awareness, indent=2, default=str)}\n",
     ]
     if steps:
@@ -390,10 +277,6 @@ def _reflection_prompt(persona, awareness: dict, steps: list[str], final_step: b
         parts.append(f"The action for this step is already decided: '{decided}'. Fill in its params.\n")
     parts.append("Respond with a single JSON object matching the schema.")
     return "\n".join(parts)
-
-
-def _local_time_str() -> str:
-    return datetime.datetime.now().strftime("%I:%M %p").lstrip("0")
 
 
 def _introspect_text() -> str:
@@ -470,82 +353,32 @@ def _say(persona, text: str) -> None:
     _expect_reaction(f'said "{memory.one_line(spoken, 80)}"')
 
 
-def _dispatch_expression(persona, name: str, params: dict) -> None:
-    now = time.time()
-    if name == "wait":
-        return
-    if name == "remember":
-        memory.remember(params["kind"], params["about"], params["category"], params["text"])
-        journal.log("remembered", f"{params['kind']}/{params['about']}: {params['text']}")
-        return
-    if name == "remind_me":
-        reminders, _, rest_until = agenda.session_lists()
-        reminders = agenda.add_reminder(reminders, params["in_minutes"], params["about"], now)
-        at = now + params["in_minutes"] * 60
-        state.update_session({"reminders": reminders, "rest_until": max(rest_until, at)})
-        journal.log("planned", f"reminder at {_in(at)}: {params['about']} (resting till then)")
-        return
-    if name == "watch":
-        _, watches, _ = agenda.session_lists()
-        state.update_session({"watches": agenda.add_watch(watches, params["for"], params["about"], now)})
-        journal.log("planned", f"watching for {params['for']}: {params['about']}")
-        return
-    if name == "rest":
-        until = now + params["minutes"] * 60
-        state.update_session({"rest_until": until})
-        journal.log("planned", f"resting until {_in(until)}")
-        return
-    if name == "wish":
-        memory.remember("self", "wishes", "wish", f"{datetime.datetime.now():%Y-%m-%d} {params['text']}")
-        journal.log("wished", params["text"])
-        return
+def _ctx(persona) -> dict:
+    """What a skill's muscle gets from the mind: its voice, a way to watch how people react, its own status."""
+    return {"channel": "mind", "who": None, "say": lambda text: _say(persona, text),
+            "expect_reaction": _expect_reaction, "status": _introspect_text}
 
-    # Anti-flap: output is throttled independently of how often it reflects.
-    if name not in COOLDOWN_EXEMPT:
-        last_expression_ts = state.load_session().get("last_expression_ts", 0)
-        if now - last_expression_ts < cfg.EXPRESSION_COOLDOWN_S:
-            dash_events.log_event("safety", f"mind expression suppressed (cooldown): wanted {name}")
-            journal.log("held_back", f"wanted to {name}, but I just did something")
-            return
 
-    effect = "motion" if name == "gesture" and params["name"] in cfg.PLAYFUL_ACTIONS else EXPRESSION_EFFECT.get(name, "other")
-    verdict = policy.evaluate(effect)
+def _dispatch_expression(persona, skill: skills.Skill, params: dict, book: dict[str, skills.Skill]) -> None:
+    """A chosen action: its skill's muscle -- unless, by its effect, the cooldown or the policy holds it back."""
+    name, what = skill.name, " ".join([skill.name, *map(str, params.values())])
+    # Anti-flap: sound and motion are throttled, independently of how often it reflects. A gesture
+    # is the model's call, whenever it likes: nothing else moves the body when nobody's talking to it.
+    if skill.effect in ("audio", "motion") and \
+            time.time() - state.load_session().get("last_expression_ts", 0) < cfg.EXPRESSION_COOLDOWN_S:
+        dash_events.log_event("safety", f"mind expression suppressed (cooldown): wanted {name}")
+        journal.log("held_back", f"wanted to {name}, but I just did something")
+        return
+    verdict = policy.evaluate(skill.effect or "other")
     if not verdict.allowed:
         dash_events.log_event("safety", f"mind expression suppressed ({name}): {verdict.reason}")
-        journal.log("held_back", f"wanted to {name}{': ' + params['text'] if name == 'speak' else ''}, "
-                                 f"but {verdict.reason}")
+        journal.log("held_back", f"wanted to {what}, but {verdict.reason}")
         return
-
-    if name == "speak":
-        _say(persona, params["text"])
-    elif name in ("gesture", "play_sound"):
-        if motor_dispatch([params["name"]], wait=True):
-            journal.log("did", f"{name} {params['name']}")
-            _expect_reaction(f"did a {params['name']} {name.replace('_', ' ')}")
-            if name == "play_sound":  # a gesture doesn't start the speech cooldown
-                state.update_session({"last_expression_ts": time.time()})
-        else:
-            dash_events.log_event("safety", f"mind {name} failed to dispatch: {params['name']}")
-    elif name == "time_check":
-        _say(persona, f"It is currently {_local_time_str()}.")
-    elif name == "sleep":
-        journal.log("did", "went to sleep on my own -- dark and quiet, nobody around")
-        dash_events.log_event("wake", "went to sleep (own decision)")
-        state.update_session({"asleep": True})
-        motor_dispatch(["look down"], wait=True)
-    elif name in ("go_to", "explore"):
-        from common.motor_client import navigate
-        task = {"approach": params["target"]} if name == "go_to" else {"explore": params["seconds"]}
-        ok, err = navigate(task)
-        what = f"to the {params['target']}" if name == "go_to" else f"around for {params['seconds']}s"
-        if ok:
-            journal.log("did", f"decided to drive {what}")
-            _expect_reaction(f"drove {what}")
-            state.update_session({"last_expression_ts": time.time()})
-        else:
-            journal.log("held_back", f"wanted to drive {what}, but: {err or 'the body did not answer'}")
-    elif name == "introspect":
-        _say(persona, _introspect_text())
+    did = skills.use(name, _ctx(persona), params, book)
+    if skill.effect in ("audio", "motion"):
+        state.update_session({"last_expression_ts": time.time()})
+    if did:
+        print(f"reflection: {name}: {did}")
 
 
 QUICK_REACT_GAP_S = 5.0  # between two reactions to a hand -- a second bump 5s later is a second bump
@@ -587,48 +420,6 @@ def _react_to_touch(persona, events: list[Event]) -> list[Event]:
     return [(k, t) for k, t in events if k != "approach"]
 
 
-def _run_tool(name: str, params: dict) -> str:
-    """Executes a TOOL and returns a plain-English observation for the next step."""
-    if name == "look":
-        direction = params["direction"]
-        turned = direction != "ahead" and policy.evaluate(
-            "presence").allowed
-        if direction != "ahead" and not turned:
-            direction, note = "ahead", " (couldn't turn your head right now, so you looked straight ahead)"
-        else:
-            note = ""
-        if turned and not motor_dispatch([f"look {direction}"], wait=True):
-            turned, direction, note = False, "ahead", " (your head didn't turn, so you looked straight ahead)"
-        try:
-            seen = vision.look(cfg.LLM_BASE_URL, cfg.LLM_MODEL, direction,
-                               head=cfg.LOOK_ANGLES.get(direction) if turned else None)
-        finally:
-            if turned:
-                motor_dispatch(["look ahead"], wait=True)
-        if seen is None:
-            return f"look {direction}: your camera didn't work this time{note}"
-        change = f" -- changed since last time: {seen['what_changed']}" if seen["changed"] else ""
-        found = f" -- {seen['bearings']}" if seen.get("bearings") else ""
-        if found:
-            journal.log("found", seen["bearings"])
-        return f"look {direction}: {seen['scene']}{change}{note}{found}"
-    if name == "listen":
-        time.sleep(LISTEN_S)
-        heard = hearing.read()
-        if heard is None or not heard["levels"]:
-            return "listen: your hearing service (openbot-ears) isn't answering right now -- that's not silence"
-        n, levels = int(LISTEN_S), heard["levels"]
-        recent, room = levels[-n:], sorted(levels)[len(levels) // 2]
-        return (f"listen: {hearing.describe(heard['sounds'][-n:])}; loudness over the last {n}s {recent} "
-                f"(typical for this room ~{room}; quiet ~300, talking ~1000+, a bang 3000+)")
-    if name == "recall":
-        found = memory.recall(params["query"])
-        if found is None:
-            return "recall: your memory isn't answering right now"
-        return f"recall {params['query']!r}: " + ("; ".join(found) if found else "nothing comes to mind")
-    raise MindError(f"not a tool: {name}")
-
-
 def _apply_goals(data: dict, thought: str) -> None:
     """Goal changes from the chain's concluding step only -- mid-chain the
     model rewords its goals every step."""
@@ -654,6 +445,12 @@ def _apply_goals(data: dict, thought: str) -> None:
         agenda.save_goals(goals)
 
 
+def _reminder_events(now: float) -> list[Event]:
+    """Its own reminders, due now -- the ones people asked for are openbot-tasks' and openbot-chat's."""
+    return [("reminder", f"a reminder you set yourself: {r['about']}")
+            for r in agenda.take_due(lambda to: to == "mind", now)]
+
+
 def _notice(events: list[Event]) -> list[dict]:
     """Records what just happened and returns the watches it triggered."""
     for _, text in events:
@@ -669,7 +466,7 @@ def _notice(events: list[Event]) -> list[dict]:
 def _reflect_once(persona, events: list[Event], watch_hits: list[dict],
                   sense: Callable[[], list[Event]]) -> None:
     awareness = _build_awareness(events, watch_hits)
-    all_actions = sorted(ALLOWED_EXPRESSIONS | TOOLS)
+    book = _skills()
     mood_before = state.load_session().get("mood")
     steps: list[str] = []
     for step in range(cfg.MIND_MAX_STEPS):
@@ -683,11 +480,11 @@ def _reflect_once(persona, events: list[Event], watch_hits: list[dict],
                 steps.append(f"INTERRUPTION -- just happened: {'; '.join(t for _, t in fresh)}{why}")
         health.record_success(COMPONENT)  # a long chain must not look like a hang to the watchdog
         final = step == cfg.MIND_MAX_STEPS - 1
-        decided = _decided_action(awareness) if step == 0 else None
-        actions = [decided] if decided else sorted(ALLOWED_EXPRESSIONS) if final else all_actions
+        decided = _decided_action(awareness, book) if step == 0 else None
+        actions = [decided] if decided else sorted(n for n, s in book.items() if not (final and s.tool))
         t0 = time.monotonic()
         result = cognition.ask(cfg.LLM_BASE_URL, cfg.LLM_MODEL,
-                               _reflection_prompt(persona, awareness, steps, final, decided),
+                               _reflection_prompt(persona, awareness, steps, final, book, decided),
                                json_schema=_reflection_schema(actions), timeout_s=45.0)
         print(f"reflection step {step}: llm {time.monotonic() - t0:.1f}s ({result.status})")
         if result.status != cognition.AVAILABLE:
@@ -696,7 +493,7 @@ def _reflect_once(persona, events: list[Event], watch_hits: list[dict],
             return
         try:
             data = json.loads(result.text)
-            name, params = validate_expression(data, cfg.STATIONARY_ACTIONS)
+            name, params = validate_expression(data, book)
         except (json.JSONDecodeError, MindError) as e:
             print(f"reflection: invalid response: {e}")
             health.record_failure(COMPONENT, str(e))
@@ -709,15 +506,15 @@ def _reflect_once(persona, events: list[Event], watch_hits: list[dict],
                               "touch_plan": plan if plan["gesture"] in cfg.TONE_ACTIONS else None})
         journal.log("thought", f"({mood}) {thought}")
         dash_events.log_event("safety", f"mind: mood={mood} thought={thought!r} -> {name} {params or ''}")
-        if name in TOOLS:
+        if book[name].tool:
             t0 = time.monotonic()
-            observation = _run_tool(name, params)
+            observation = skills.use(name, _ctx(persona), params, book) or f"{name}: that didn't work this time"
             print(f"reflection step {step}: {name} {time.monotonic() - t0:.1f}s")
             journal.log("found", observation)
             steps.append(observation)
             continue
         _apply_goals(data, thought)
-        _dispatch_expression(persona, name, params)
+        _dispatch_expression(persona, book[name], params, book)
         if _text_decider:
             threading.Thread(target=_consider_texting, daemon=True,
                              args=(persona, events, steps, mood_before, mood, thought, name)).start()
@@ -860,9 +657,10 @@ def _dream(persona) -> None:
     except (json.JSONDecodeError, AttributeError):
         return
     kept: list[str] = []
+    book = _skills()
     for n in notes:
         try:
-            _, p = validate_expression({"action": "remember", "params": n}, cfg.STATIONARY_ACTIONS)
+            _, p = validate_expression({"action": "remember", "params": n}, book)
         except MindError:
             continue
         memory.remember(p["kind"], p["about"], p["category"], p["text"])
@@ -921,32 +719,38 @@ def _make_sensor() -> Callable[[], list[Event]]:
     last_sound = [0.0, 0.0]  # (time, loudness) of the last sound surprise
     last_motion = [0.0]
     was_driving = [False]
+    imu_still: list = [None]  # the IMU's last still snapshot: turns and tips are measured from one to the next
+    went_far = [False]        # picked up or driven since then: the map's bearings went with it
 
     def sense() -> list[Event]:
         nonlocal latches
         events: list[Event] = []
         s = sensors.read()
+        body = s.get("imu") if time.time() - (s.get("imu") or {}).get("ts", 0) < 3 else None  # None: no IMU
         if time.time() - s.get("ts", 0) < 5:  # openbot-alive is publishing
             distances.append(s.get("distance"))
             moved = surprise.distance_events(list(distances))
             if moved:
                 distances.clear()  # report an approach once, not once per sample while the window rolls past it
             new_latches = s.get("latches") or {}
-            lifted = surprise.latch_events(latches, new_latches)
+            lifted = surprise.latch_events(latches, new_latches, body["moved_by_others"] if body else None)
             events += moved + lifted
             latches = new_latches
-            how = "picked up" if any(k in ("picked_up", "put_down") for k, _ in lifted) else \
-                "drove" if bool(s.get("driving")) != was_driving[0] else None
+            carried_off = any(k in ("picked_up", "put_down") for k, _ in lifted) and (not body or body["moved_by_others"])
+            how = "picked up" if carried_off else "drove" if bool(s.get("driving")) != was_driving[0] else None
             was_driving[0] = bool(s.get("driving"))
             if how:  # the body moved: which way it faces is unknown until a look recognizes its map
                 vision.lost_bearings()
                 state.update_session({"moved_ts": time.time(), "moved_how": how})
+                went_far[0] = True
             events += surprise.battery_events(battery[0], s.get("battery_pct"))
             battery[0] = s.get("battery_pct")
+        if body and not body["moving"]:
+            events += _settled(body, imu_still, went_far)
         events += _people_events(present, streaks)
         head_still = time.time() - ((s.get("head") or {}).get("moved_ts") or 0) > HEAD_SETTLE_S
-        carried = (s.get("latches") or {}).get("cliff") or \
-            time.time() - state.load_session().get("moved_ts", 0) < HEAD_SETTLE_S  # in the air, or just set down
+        carried = (s.get("latches") or {}).get("cliff") or (body and body["moving"]) or \
+            time.time() - state.load_session().get("moved_ts", 0) < HEAD_SETTLE_S  # in the air, turning, or just set down
         if head_still and not carried and not _recently_self_noisy() and not faces.read().get("faces") \
                 and time.time() - last_motion[0] > 60:
             moving = surprise.motion_events(sensors.read_motion())  # a face in view is already an event
@@ -967,6 +771,31 @@ def _make_sensor() -> Callable[[], list[Event]]:
         return events
 
     return sense
+
+
+def _settled(body: dict, imu_still: list, went_far: list) -> list[Event]:
+    """The body is still again (common/imu.py): what it felt since it last was. Turned in
+    place -- by someone, or by its own move -- it still knows which way it faces (the map
+    turns with it); picked up or driven, the lost-bearings flow above already took over."""
+    before = imu_still[0] or state.load_session().get("imu_settled")  # kept across a night's sleep or a restart
+    imu_still[0] = body
+    if not before or before.get("epoch") != body["epoch"]:  # nothing to compare, or openbot-alive restarted
+        went_far[0] = False
+        state.update_session({"imu_settled": body})
+        return []
+    turned = body["heading"] - before["heading"]
+    if abs(turned) < 1 and abs(body["turned_by_others"] - before["turned_by_others"]) < 1 \
+            and abs(body["tilt"] - before["tilt"]) < 3:
+        return []  # nothing new (no writes every half second while it sits still)
+    if abs(turned) >= 2 and not went_far[0]:
+        vision.turn_by(turned)
+    went_far[0] = False
+    state.update_session({"imu_settled": body})
+    events = surprise.imu_events(before, body)
+    for kind, text in events:
+        if kind == "turned":
+            state.update_session({"moved_ts": time.time(), "moved_how": text.replace("someone turned you", "turned")})
+    return events
 
 
 STRANGER = "__stranger__"
@@ -1109,11 +938,9 @@ def main() -> None:
             if seen and seen["changed"] and not _recently_self_noisy() and not faces.read().get("faces"):
                 events.append((seen.get("kind", "scene"), f"you see something new: {seen['what_changed'] or seen['scene']}"))
             next_look = time.time() + cfg.VISION_INTERVAL_S
-        reminders, _, rest_until = agenda.session_lists()
-        fired, pending = agenda.due(reminders, now)
-        if fired:
-            state.update_session({"reminders": pending})
-            events += [("reminder", f"a reminder you set yourself: {r['about']}") for r in fired]
+        rest_until = agenda.session_lists()[2]
+        fired = _reminder_events(now)
+        events += fired
 
         events = _react_to_touch(persona, events) if events else events  # a hand in front: now, talking or not
         events = _greet_arrivals(persona, events) if events and not in_session else events

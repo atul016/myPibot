@@ -19,7 +19,7 @@ for f in "$DIR"/systemd/openbot-*.service; do
 done
 systemctl daemon-reload
 
-units=(openbot-memory openbot-camera openbot-ears openbot-speak openbot-wake-listen openbot-mind openbot-dashboard)
+units=(openbot-memory openbot-camera openbot-ears openbot-speak openbot-wake-listen openbot-mind openbot-tasks openbot-dashboard)
 if [ "${OPENBOT_BODY:-none}" = "none" ]; then
   systemctl disable --now openbot-alive 2>/dev/null || true  # no body to drive
 else

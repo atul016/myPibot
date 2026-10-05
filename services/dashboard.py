@@ -19,7 +19,7 @@ from common import agenda, faces, health, jev, journal, memory, objects, sensors
 from dashboard.page import PAGE
 
 PORT = int(os.environ.get("OPENBOT_DASHBOARD_PORT", "8080"))
-HEALTH_COMPONENTS = ["openbot-alive"] * (os.environ.get("OPENBOT_BODY", "none") != "none") + ["openbot-ears", "openbot-wake-listen", "openbot-mind", "openbot-speak", "openbot-camera"] \
+HEALTH_COMPONENTS = ["openbot-alive"] * (os.environ.get("OPENBOT_BODY", "none") != "none") + ["openbot-ears", "openbot-wake-listen", "openbot-mind", "openbot-speak", "openbot-tasks", "openbot-camera"] \
     + ["openbot-chat"] * bool(os.environ.get("OPENBOT_CHAT_ALLOW"))
 STATE_ROOT = state.STATE_DIR.resolve()
 
@@ -75,7 +75,11 @@ def api_mind():
         "who": faces.describe(faces.read()),
         "summary": journal.read_summary(dt.date.today()),
         "goals": agenda.open_goals(agenda.load_goals()),
-        "reminders": [{"at": r["at"], "about": r["about"]} for r in reminders],
+        "reminders": [{"at": r["at"], "about": r["about"] + ("" if r.get("to", "mind") == "mind" else
+                                                         f" ({'out loud' if r['to'] == 'home' else 'by text'}"
+                                                         + (f", for {r['who']}" if r.get("who") else "") + ")")}
+                      for r in reminders],
+        "tasks": agenda.load_tasks(),
         "watches": [w for w in watches if w["until"] > now],
         "resting_until": rest_until if rest_until > now else None,
         "reactions": reactions,

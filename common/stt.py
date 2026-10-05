@@ -80,8 +80,8 @@ def vosk_text(results: list[dict]) -> str:
 class Whisper:
     # Names the model would otherwise mishear ("Rocket") -- Whisper's
     # initial_prompt biases spelling toward them.
-    # Also the voice commands (common/commands.py): a spoken "quiet" came back
-    # as "quite" without this hint.
+    # Also what people say to it most: a spoken "quiet" came back as "quite"
+    # without this hint.
     PROMPT = ("{0} is a small robot. People talk to {0}. "
               "Commands: be quiet, go to sleep, {0} wake up, stop session.").format(CURRENT.capitalize())
 

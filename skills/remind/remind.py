@@ -1,14 +1,16 @@
-"""remind's muscle: a text reminder for openbot-chat's notifier to send when it's due."""
+"""remind's muscle: a reminder in the shared list (common/agenda.py) -- texted to them by openbot-chat
+when asked for by text, said out loud at home by openbot-tasks when asked for out loud."""
 import datetime
 
-from common import journal, memory, state, tools
+from common import agenda, journal, tools
 
 
 def run(ctx: dict, at: str, about: str) -> str:
-    when, about = tools.remind_time(at), memory.one_line(about, 200)
-    if not when or not about or not ctx.get("number"):
-        return "You couldn't set that reminder: the time or what it's about wasn't clear -- ask them."
-    state.update_session({"text_reminders": state.load_session().get("text_reminders", [])
-                          + [{"at": when, "about": about, "number": ctx["number"]}]})
-    journal.log("planned", f"remind {ctx['who']} at {datetime.datetime.fromtimestamp(when):%a %H:%M}: {about}")
-    return f"You set a reminder: you'll text them at {datetime.datetime.fromtimestamp(when):%H:%M} about {about}."
+    when = tools.remind_time(at)
+    to = ctx.get("number") if ctx["channel"] == "text" else "home"
+    if not when or not to:
+        return "You couldn't set that reminder: when it's for wasn't clear -- ask them."
+    agenda.remind(when, about, to, ctx.get("who"))
+    hhmm, how = f"{datetime.datetime.fromtimestamp(when):%H:%M}", "text them" if to != "home" else "say it out loud"
+    journal.log("planned", f"remind {ctx.get('who') or 'them'} at {hhmm} ({how}): {about}")
+    return f"You set a reminder: at {hhmm} you'll {how} -- {about}."

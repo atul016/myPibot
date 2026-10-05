@@ -48,7 +48,21 @@ CASES = [  # (their text, session, the skills it must do -- "refused": must name
     ("/be-quite", {"in_session": True}, {"end_conversation"}, None, []),     # how "quiet" often gets typed
     ("drive forward", {}, "refused", None, []),          # needs someone there: says so, does nothing
     ("look left", {}, "refused", None, []),
+    ("Remember that Anna's birthday is in May", {}, {"remember"}, lambda a: a[0].kind == "person", []),
+    ("remind me in 20 minutes to check the oven", {}, {"remind"}, lambda a: a[0].at == "in 20 minutes", []),
+    ("add milk to my shopping list", {}, {"add_task"}, None, []),
+    ("what's on my to-do list?", {}, {"list_tasks"}, None, []),
+    ("I bought the milk, take it off my list", {}, {"finish_task"}, None, []),
+    ("I need to buy milk", {}, set(), None, []),         # only says so: not "keep it for me"
+    ("remind me what you said", {}, set(), None, []),
+    ("Yes please", {}, {"send_photo"}, None,             # "yes" to its own offer: the talk before counts...
+     [{"role": "user", "content": "what's going on at home?"},
+      {"role": "assistant", "content": json.dumps({"tone_action": "none", "reply": "Quiet here. Want a photo?"})}]),
+    ("ok", {}, set(), None,                               # ...but isn't redone
+     [{"role": "user", "content": "send me a pic"},
+      {"role": "assistant", "content": json.dumps({"tone_action": "none", "reply": "Here you go!"})}]),
     ("I'm too quiet today", {}, set(), None, []),        # words that used to be commands
+    ("I remember my first bike", {}, set(), None, []),
     ("how are you?", {}, set(), None, []),
     ("It was always der", {}, set(), None,               # an answer to its own text -- read in context
      [{"role": "user", "content": "(nobody texted -- you texted them first)"},

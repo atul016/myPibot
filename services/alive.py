@@ -26,11 +26,11 @@ import threading
 import time
 
 import common.system  # noqa: F401 -- os.getlogin() shim, side effect only, import before any Picarx()
-import movement.bus  # noqa: F401 -- one lock around all I2C traffic (threads were corrupting ADC reads)
+import movement.bus  # one lock around all I2C traffic (threads were corrupting ADC reads)
 
 import config as cfg  # noqa: E402
 from common import events as dash_events  # noqa: E402
-from common import faces, health, journal, persona as persona_mod, policy, react, sensors, state, surprise  # noqa: E402
+from common import faces, health, imu, journal, persona as persona_mod, policy, react, sensors, state, surprise  # noqa: E402
 from common.bounded import run_bounded  # noqa: E402
 from common.motor_client import SOCK_PATH  # noqa: E402
 from common import speak_client as speak_client_mod  # noqa: E402
@@ -211,6 +211,7 @@ def main() -> None:
 
     threading.Thread(target=_action_server, args=(action_flow, car, monitor), daemon=True).start()
     threading.Thread(target=_face_tracker, args=(car, action_flow), daemon=True).start()
+    threading.Thread(target=_imu_loop, args=(action_flow,), daemon=True).start()
 
     health.record_success(COMPONENT)
     next_sensor_publish = 0.0
@@ -253,7 +254,7 @@ def main() -> None:
                 # The drive guards itself; reflexes (a bullfight push!) and fidgets would fight it.
                 if time.time() >= next_sensor_publish:
                     sensors.publish(**monitor.snapshot(), battery_v=battery_v, battery_pct=battery_pct, driving=True,
-                                    head=dict(HEAD))
+                                    head=dict(HEAD), imu=IMU_NOW[0])
                     next_sensor_publish = time.time() + 1.0
                 health.record_success(COMPONENT, min_interval_s=5.0)
                 time.sleep(0.05)
@@ -266,12 +267,53 @@ def main() -> None:
                 HEAD_MOVED.clear()
                 next_sensor_publish = 0.0
             if time.time() >= next_sensor_publish:
-                sensors.publish(**monitor.snapshot(), battery_v=battery_v, battery_pct=battery_pct, head=dict(HEAD))
+                sensors.publish(**monitor.snapshot(), battery_v=battery_v, battery_pct=battery_pct, head=dict(HEAD),
+                                imu=IMU_NOW[0])
                 next_sensor_publish = time.time() + 1.0
             time.sleep(0.01)
     finally:
         action_flow.stop()
         car.stop()
+
+
+IMU_NOW: list[dict | None] = [None]  # the latest common/imu.py snapshot (swapped whole), published with the sensors
+SELF_MOTION_GRACE_S = 2.0  # after its own move ends, the wheels coast and the body settles: still its own doing
+
+
+def _imu_loop(action_flow: ActionFlow) -> None:
+    """The body's inertial sense, 25 times a second. Never takes this service down: no IMU on
+    the bus -> nothing published; a run of failed reads -> open it again. It moved by itself
+    while a drive, a gesture or a reflex runs (the action queue is busy until it's done), and
+    when the face tracker turns the head (measured: each glance read as "moved by someone")."""
+    try:
+        sensor = imu.Sensor(lock=movement.bus.BUS_LOCK)
+        ax = imu.axes(cfg.IMU_AXES)
+    except Exception as e:
+        print(f"imu: none ({e}) -- no heading or tilt")
+        return
+    tracker, last_self, failures = imu.Tracker(time.time()), 0.0, 0
+    print(f"imu: reading, axes forward/right/down = {cfg.IMU_AXES}")
+    while True:
+        t0 = time.time()
+        try:
+            acc, gyr = sensor.sample()
+            failures = 0
+        except Exception as e:
+            failures += 1
+            if failures % 25 == 0:
+                print(f"imu: {failures} failed reads ({e}) -- opening it again")
+                try:
+                    sensor = imu.Sensor(lock=movement.bus.BUS_LOCK)
+                except Exception:
+                    pass
+            time.sleep(0.2)
+            continue
+        now = time.time()
+        if NAVIGATING.is_set() or action_flow.status != ActionStatus.STANDBY or now - HEAD["moved_ts"] < 1.0:
+            last_self = now  # its own drive, gesture or reflex -- or its head turning: the servos jolt the body
+        tracker.update(imu.to_body(acc, ax), imu.to_body(gyr, ax), now, now - last_self < SELF_MOTION_GRACE_S)
+        IMU_NOW[0] = tracker.snapshot(now)
+        time.sleep(max(0.0, 0.04 - (time.time() - t0)))
 
 
 # Where the head points (by the tracker's own writes) and when it last moved -- published with the

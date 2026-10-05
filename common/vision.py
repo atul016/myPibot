@@ -111,6 +111,15 @@ def lost_bearings() -> None:
         atomic_write(VISION_PATH, json.dumps({**record, "lost": {"since": time.time(), "tries": 0}}))
 
 
+def turn_by(degrees: float) -> None:
+    """The body turned in place this far (the IMU felt it; + = right): which way it faces is
+    still known -- no need to recognize a view again."""
+    record = last_look()
+    if record and not record.get("lost"):
+        heading = (record.get("heading", 0.0) + degrees + 180) % 360 - 180
+        atomic_write(VISION_PATH, json.dumps({**record, "heading": round(heading, 1)}))
+
+
 def facing_words() -> str:
     """Which way the body faces, for the mind's prompt."""
     record = last_look()
@@ -287,6 +296,9 @@ def demo() -> None:
         assert view_key(0, 0) == view_key(8, -5) == "+0,+0" and view_key(30, 0) != view_key(0, 0) != view_key(-45, 0)
         _save({"scene": "a desk", "changed": False, "what_changed": "", "direction": "ahead", "head": (30, 0)})
         assert last_look()["views"][view_key(30, 0)] == "a desk" and facing_words().startswith("the way you faced")
+        turn_by(100)  # turned in place, felt by the IMU: still known
+        assert last_look()["heading"] == 100.0 and facing_words().startswith("turned 100 degrees to the right")
+        turn_by(-100)
         lost_bearings()  # picked up and turned: which way it faces is unknown -- but the map stays
         assert last_look()["lost"] and last_look()["views"]["+40,+0"] == "a desk" and facing_words().startswith("not sure")
         real_ask = cognition.ask

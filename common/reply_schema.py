@@ -5,9 +5,9 @@ prompt instruction alone. tone_action is a Literal built from the hardware's
 own stationary-action list (config.STATIONARY_ACTIONS) so the schema and
 the real action vocabulary can't independently drift apart.
 
-No movement field: movement is entirely keyword-driven (movement/
-keywords.py), not LLM-chosen -- a small local model reliably hears a move
-command but doesn't reliably request the matching action.
+No movement field: what it does is its skills (common/skills.py),
+decided by a separate call before the reply -- which is told what was done,
+so the words can't claim a move that didn't happen.
 """
 from __future__ import annotations
 

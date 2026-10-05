@@ -262,7 +262,8 @@ function loadMind() {
     ).join('') || '<div style="color:#999">No open goals.</div>';
     document.getElementById('mind-plans').innerHTML =
       (m.reminders || []).map(r => `<div class="row"><span>⏰ ${esc(r.about)}</span><span>${timeOf(r.at)}</span></div>`).join('') +
-      (m.watches || []).map(w => `<div class="row"><span>👁 ${esc(w.for)}: ${esc(w.about)}</span></div>`).join('') ||
+      (m.watches || []).map(w => `<div class="row"><span>👁 ${esc(w.for)}: ${esc(w.about)}</span></div>`).join('') +
+      (m.tasks || []).map(t => `<div class="row"><span>☐ ${esc(t.item)}</span><span>${esc(t.who || '')}</span></div>`).join('') ||
       '<div style="color:#999">Nothing scheduled.</div>';
     document.getElementById('mind-reactions').innerHTML = (m.reactions || []).map(r => `<div>${esc(r)}</div>`).join('') ||
       '<div style="color:#999">No reactions recorded yet.</div>';

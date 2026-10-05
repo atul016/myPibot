@@ -65,12 +65,6 @@ DIRECT = ("s.whatsapp.net", "lid")  # one-to-one chats; not groups (g.us), statu
 CHAT_NOTE = ("\n\nRight now you're chatting by WhatsApp text. Your message tells you what you did about theirs: "
              "never say you're doing anything else, or about to -- the rest of what your body does needs someone "
              "next to you, out loud.")
-# Step 1 of a turn: what to DO -- just the skills, its own short call (common/skills.py).
-DECIDE = ("You're a small robot, and someone just texted you on WhatsApp. Here you only decide what to DO about "
-          "their message: put each skill it asks for in `actions` -- none for plain chat, questions or news. Your "
-          "words come after, separately. When they ask, do it -- it's their call.\n\nYour skills:\n")
-DECIDE_TEMPERATURE = 0.1  # the same message should get the same decision; the words keep their own temperature
-
 # Texts it started, by WhatsApp message id: replies and emoji reactions to them are outcomes (common/outcomes.py).
 _sent: dict[str, dict] = {}
 _sent_lock = threading.Lock()  # the worker sends, whatsmeow's thread sees reactions, the notifier times out
@@ -105,12 +99,14 @@ def as_jpeg(data: bytes) -> bytes:
     return out.getvalue()
 
 
-def _ask(persona, Reply, turn: str, query: str, history: list[dict], image: bytes | None):
+def _ask(persona, Reply, turn: str, query: str, history: list[dict], image: bytes | None, did: str = ""):
     """One LLM turn as the persona, by WhatsApp: (the parsed reply or None, the
     text to send, the raw JSON -- "" when the LLM couldn't be reached: the text
-    is then a fallback). No list of physical actions: what it did is in `turn`."""
+    is then a fallback). No list of physical actions: `did` -- what this turn's
+    skills did -- goes in the system prompt, where it outweighs habit ("On it!
+    Moving forward now." to a refused move, once in three, from the message alone)."""
     system = persona.system_prompt_template([], cfg.STATIONARY_ACTIONS, cfg.describe_actions(cfg.STATIONARY_ACTIONS)) \
-        + CHAT_NOTE
+        + CHAT_NOTE + (f"\n\nThis message: {did}" if did else "")
     result = cognition.ask(cfg.LLM_BASE_URL, cfg.LLM_MODEL, journal.inject(turn, query=query), system=system,
                            json_schema=Reply.model_json_schema(), history=history, image_jpeg=image)
     if result.status != cognition.AVAILABLE or not result.text.strip():
@@ -127,25 +123,9 @@ def _ask(persona, Reply, turn: str, query: str, history: list[dict], image: byte
             return None, persona.transform(result.text.strip()), result.text
 
 
-def _decide(book: dict, situation: str, text: str, history: list[dict]) -> tuple[list, list[str]]:
-    """Step 1: which skills their message asks for -- a short LLM call that sees
-    every skill the body has and answers only with them (common/skills.py).
-    (the actions usable by text, the skills asked for that aren't)."""
-    Decision = skills.decision_model(cfg.CAN_DRIVE, book)
-    if Decision is None:
-        return [], []
-    result = cognition.ask(cfg.LLM_BASE_URL, cfg.LLM_MODEL, f"{situation}\nTheir message: {text}",
-                           system=DECIDE + skills.menu(cfg.CAN_DRIVE, book), json_schema=Decision.model_json_schema(),
-                           history=history[-6:], temperature=DECIDE_TEMPERATURE, num_predict=200)
-    if result.status != cognition.AVAILABLE:
-        print(f"{COMPONENT}: deciding: cognition {result.status}: {result.error}")
-        return [], []
-    return skills.read_decision(result.text, "text", cfg.CAN_DRIVE, book)
-
-
 def reply_to(persona, Reply, ctx: dict, text: str, history: list[dict], sent: bytes | None = None,
              known: bool = True):
-    """One exchange, in three steps like a person: decide what to do (_decide:
+    """One exchange, in three steps like a person: decide what to do (skills.decide:
     just the skills), do it (their muscles; anything a text can't do is
     refused), then say it (the persona's own call, told what was done -- so its
     words can't claim what didn't happen). ctx["who"]: the person this number is
@@ -170,10 +150,10 @@ def reply_to(persona, Reply, ctx: dict, text: str, history: list[dict], sent: by
                  if goals else "")
 
     book = skills.load()
-    actions, refused = _decide(book, body + camera + questions, text, history)
-    did = [r for a in actions if (r := _use(a, ctx))]
-    did += [f"They asked you to {book[n].description[0].lower() + book[n].description[1:].rstrip('.')} -- you can, "
-            "but only when someone asks you out loud, in person -- not by text: tell them so." for n in refused]
+    actions, refused = skills.decide(cfg.LLM_BASE_URL, cfg.LLM_MODEL, "text", cfg.CAN_DRIVE,
+                                     "Someone just texted you on WhatsApp.", body + camera + questions, text,
+                                     history, book)
+    did = [r for a in actions if (r := skills.attempt(a, ctx))] + [skills.refusal(book[n], "text") for n in refused]
 
     if known:
         turn = f"{who} is texting you on WhatsApp -- they may not be with you, and can't see your gestures. "
@@ -185,23 +165,14 @@ def reply_to(persona, Reply, ctx: dict, text: str, history: list[dict], sent: by
                 "fits, ask who they are. ")
     turn += ("Text back like a friend would: short. Texts are casual -- short forms and typos (\"der\" is "
              "\"there\", \"u\" is \"you\"), and a short text usually answers your own last one.\n")
-    turn += camera + body + ("What you did about their message: " + " ".join(did) if did else
-                             "You did nothing about their message -- don't say you're doing anything.") + "\n"
-    turn += f"\nTheir message: {text}"
-    _, reply, raw = _ask(persona, Reply, turn, text, history, sent or photo)
+    done = ("What you did about their message: " + " ".join(did) if did else
+            "You did nothing about their message -- don't say you're doing anything.")
+    turn += camera + body + done + f"\n\nTheir message: {text}"
+    _, reply, raw = _ask(persona, Reply, turn, text, history, sent or photo, done)
     if raw:
         history += [{"role": "user", "content": text}, {"role": "assistant", "content": raw}]
         del history[:-MAX_HISTORY_MESSAGES]
     return reply, photo if ctx.get("send_photo") else None, actions, refused
-
-
-def _use(action, ctx: dict) -> str | None:
-    """One skill, carried out -- a failing one must not take the reply down with it."""
-    try:
-        return skills.run(action, ctx)
-    except Exception as e:
-        print(f"{COMPONENT}: skill {action.skill} failed: {e!r}")
-        return None
 
 
 def _dream_note(day: datetime.date) -> str:
@@ -380,6 +351,13 @@ def _worker(client: NewClient, persona, Reply) -> None:
             health.record_failure(COMPONENT, repr(e))
 
 
+def _text_due_reminders(now: float) -> None:
+    """The reminders asked for by text (their `to` is the number), due now: to the worker, to text them."""
+    for r in agenda.take_due(lambda to: to not in ("mind", "home"), now):
+        _inbox.put(("tell", "reminder", f"It's time for the reminder they asked you for: {r['about']}. Text it "
+                    "to them, short and friendly.", f"Reminder: {r['about']}", [r["to"]]))
+
+
 def _notifier() -> None:
     """Texts it starts, queued for the worker so they never overlap a reply:
     the mind's (session["text_out"] -- its decision engine said yes), how
@@ -391,12 +369,7 @@ def _notifier() -> None:
         s, now = state.load_session(), datetime.datetime.now()
         today, clock = now.date().isoformat(), now.strftime("%H:%M")
         _sweep()
-        fired, waiting = agenda.due(s.get("text_reminders", []), time.time())
-        if fired:
-            state.update_session({"text_reminders": waiting})
-            for r in fired:
-                _inbox.put(("tell", "reminder", f"It's time for the reminder they asked you for: {r['about']}. Text it "
-                            "to them, short and friendly.", f"Reminder: {r['about']}", [r["number"]]))
+        _text_due_reminders(time.time())
         out = s.get("text_out")
         if out:
             state.update_session({"text_out": None})

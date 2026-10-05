@@ -47,6 +47,8 @@ The dashboard is at `http://<robot-ip>:8080`; logs: `journalctl -u openbot-wake-
 | `OPENBOT_PERSONA` | which `personas/<name>/` to be |
 | `OPENBOT_LLM_BASE_URL`, `OPENBOT_LLM_MODEL` | the brain |
 | `OPENBOT_STT_DEVICE` | part of your mic's name in `arecord -l` (openbot-ears opens it) |
+| `OPENBOT_IMU_AXES` | with a DFRobot 6 DOF IMU on I2C (0x4A): its axes that point forward, right and down, as mounted (default `+x,+y,+z`: flat, X arrow forward) -- lift the front an inch and see which one moves |
+| `OPENBOT_LOUD_FLOOR` | how loud a sudden sound must be (default 1500, for a USB dongle; a reSpeaker XVF3800 needs ~5000 -- talk and clap, then read `127.0.0.1:9001/hearing`) |
 | `OPENBOT_MIXER` | `card:control` for "louder"/"softer" (`amixer -c 0 scontrols`) |
 | `OPENBOT_CAMERA_CMD` | a USB webcam instead of the Pi camera (example in the template) |
 
@@ -56,7 +58,7 @@ the folder over, then run `sudo ~/openbot/systemd/install.sh` there.
 ## Make your own persona
 
 1. `cp -r personas/rocky personas/<name>` -- the folder name is the bot's name, lowercase.
-2. Edit `persona.py`: `NAME`, `WAKE_WORDS`, `SLEEP_WORDS`, `SLEEP_ACK` (what it says going to sleep), `piper_voice` (any
+2. Edit `persona.py`: `NAME`, `WAKE_WORDS`, `piper_voice` (any
    [Piper voice](https://huggingface.co/rhasspy/piper-voices), downloaded on first use).
    Delete `speak_overlay` and `transform` unless you want Rocky's alien voice and grammar.
 3. Edit `prompt.py`: who it is, how it talks.
@@ -121,6 +123,8 @@ openbot-alive (user)         openbot-wake-listen (user)      openbot-mind (user)
                               openbot-speak (root)
                           the ONLY process touching the amp/audio device
                                        |
+          openbot-tasks (user): says the reminders people asked for, when due
+                                       |
                             openbot-dashboard (user)
                        reads state/*.json, no hardware access at all
 ```
@@ -144,12 +148,13 @@ Reviewed as prior art for a PiCar-X voice assistant with a genuinely more
 modular shape. Four specific pieces, all fully built (not stubbed):
 
 1. **A whitelist + param validation for the one truly free-form LLM
-   decision point** -- `services/mind.py`'s `validate_expression()`. The
+   decision point** -- `services/mind.py`'s `validate_expression()`, which
+   holds the pick to that skill's own spec (`common/skills.py` `check()`). The
    *reactive* turn (`services/wake_listen.py`) doesn't need this: Ollama's
    `format=<schema>` grammar-constrained output already makes the model
    structurally unable to emit anything outside `{reply, tone_action}`, and
-   movement is decided by deterministic keyword-match
-   (`movement/keywords.py`), never by the LLM. The autonomous mind's
+   what it does is its skills, decided by a separate call before the reply
+   (see Skills) -- the reply is told what was done. The autonomous mind's
    `{action, params}` choice is a genuinely free pick among a small set,
    closer to SPARK's tool-call shape -- so it gets the same defense.
 2. **An STT fallback cascade** (`common/stt.py`) -- faster-whisper first
@@ -211,7 +216,7 @@ auth, and its ~1235-test suite.
   next step. The only wheel moves the mind may choose are the fist bump and
   bullfight nudges (short, cliff-checked); driving anywhere is a spoken command.
 - **Its own drives** (`services/mind.py`) -- besides speaking and gesturing, a reflection may:
-  `go_to` / `explore` (drive to something it sees, or wander -- the same cliff-guarded
+  `drive_to` / `explore` (drive to something it sees, or wander -- the same cliff-guarded
   `movement/navigate.py` as spoken commands; never in the dark), `sleep` on its own when
   it's dark and quiet with nobody around (or the battery is very low), and `wish` for
   something it can't do (written to `state/mind/self/wishes.md` -- read it). Its awareness
@@ -287,8 +292,8 @@ someone it already knows) and that number is Atul's -- the person it knows by fa
 notes, which gain "Atul texts me on WhatsApp". The number itself stays in `~/.openbot-whatsapp/`.
 
 **Asking it to do things** -- in your own words: "stop texting me for an hour", "remind me at 17:30
-to call mom", "send me a pic", "you're too loud", "go to sleep" / "wake up", "be quiet" (ends a
-conversation someone is having with it out loud). See [Skills](#skills-what-it-can-do).
+to call mom", "add milk to my list", "send me a pic", "you're too loud", "go to sleep" / "wake up",
+"be quiet" (ends a conversation someone is having with it out loud). See [Skills](#skills-what-it-can-do).
 
 **It texts first**, too:
 - how its day went, at 8 PM (`OPENBOT_CHAT_SUMMARY_AT=20:00`), and last night's dream in the
@@ -380,31 +385,74 @@ Use when they ask you not to message them for a while: "stop texting me for an h
 ```
 
 `where` says which channels may use it (`text`, `voice`, `mind`); `needs: body` hides it on a
-robot that can't drive. A turn is three steps, like a person: **decide** (a short LLM call that
+robot that can't drive. A param can say more than its type: `(integer, 1-720)`, `(string, max 300)`,
+`(direction, default ahead)` -- `direction`, `gesture`, `sound`, `memory_kind` and `watch_kind` are
+this body's own lists, and a skill whose list is empty (no sounds without a PiCar-X) isn't offered.
+What a decision is shown and what its answer is checked against come from that one line. A turn is three steps, like a person: **decide** (a short LLM call that
 sees every skill the body has and answers only with the ones the message asks for), **do**
 (code keeps what this channel may do -- a text can't drive -- and runs each skill's `run()`,
 which says what happened), then **say** (the persona writes the reply, told exactly what was
 done -- so it can't claim a move it didn't make). Reflexes stay in code: an instant "stop",
 edge and battery safety.
 
-Measured through the real LLM (`tests/test_chat_skills.py`, 11 texts x 5): 54/55 right --
-the one miss a wording, not a decision -- vs 29/33 when one call both chose and replied ("look
-left" got "Looking left!" every time). Texting runs on skills now; speaking and the mind's own
-tools are next.
+Measured through the real LLM: texting (`tests/test_chat_skills.py`, 23 texts x 3) 69/69, vs
+29/33 when one call both chose and replied ("look left" got "Looking left!" every time); speaking
+(`tests/test_voice_skills.py`, 32 things said x 3) 96/96. The decide call adds ~0.15s to a spoken reply (1.25s to the
+first sentence, was 1.11s) -- the server caches its fixed prompt.
 
-## Voice commands (`common/commands.py`)
+The mind's actions are skills too (`where: mind`: speak, gesture, look, listen, recall, remember,
+remind_me, watch, rest, wish, sleep, drive_to, explore...). Its reflection's list, the JSON schema's
+choices, Jev's options and the checking of what it picks all come from the `.md` -- a new action is a
+new folder, not four edits in `services/mind.py` that have to agree. `tool: yes` means it sees what
+the muscle returns and decides again (look, listen, recall); `effect: audio` or `motion` puts it under
+the anti-flap cooldown and the sleep gate, `presence` under the gate only. A skill people use too
+gives the mind its own line (`mind: Only for the night, when it's dark and quiet...`) in place of the
+when-they-ask text. The mind's own restraint stays in its code: never drive in the dark, sleep only when
+tired with nobody in view. Through the real LLM, 24 reflections: 23 picked an action that held up
+(22/24 with the old hand-written list), with the same mix of looking, listening and resting.
+
+## The body's sense of turning (IMU, optional)
+
+With a DFRobot Gravity 6 DOF IMU on the robot board's I2C pins, `openbot-alive` reads it 25 times a
+second (`common/imu.py`) and publishes how far the body has turned, how it's tilted and whether it's
+moving. Turned on the spot -- by someone, or by its own move -- it still knows which way it faces (the
+camera's view map turns with it, `vision.turn_by`), instead of guessing until it recognizes a view; and
+the mind notices being turned ("someone turned you about 90 degrees to your left"), lying tipped,
+and tells an edge (nothing touched it) from being picked up. Its own gestures, moves, drives and the
+cliff reflex aren't "someone": the action queue says when the body is moving itself. The turn rate is
+taken about the vertical (gyro projected on gravity), so holding it at an angle doesn't skew the count,
+and the gyro's bias is learned only while it's still. No IMU: everything works as before.
+
+## Tasks and reminders
+
+Ask by text or out loud, in your own words: "add milk to my list", "what's on my list?", "I bought the
+milk" (skills `add_task`, `list_tasks`, `finish_task` -- one household list), "remind me at 17:30 to
+call mom", "remind me in 20 minutes to check the oven" (`remind`). A reminder asked for by text is
+texted back by `openbot-chat`; one asked for out loud is said out loud at home by `openbot-tasks`, the
+second it's due -- asleep or not, like an alarm, and whatever the mind is busy thinking. The mind's own
+reminders (`remind_me`) are in the same list (`common/agenda.py`) and come back to it as a thought.
+Both lists live in `state/session.json`, changed under its lock (`state.change_session`) -- never in
+`state/mind/`, which Basic Memory indexes: a texted reminder carries a phone number. The dashboard's Mind
+tab shows them. Not yet: cancelling a reminder by asking, "tomorrow at 9" said before 9 (it's today's),
+texting a reminder that was asked for out loud.
+
+## Talking to it
 
 Say the persona's name ("Rocky") to start a conversation. It stays open -- pauses and silence never
-end it -- until one of:
+end it -- until you ask it to stop. There are no commands to learn: say what you want in your own
+words, and its [skills](#skills-what-it-can-do) decide -- "be quiet" or "that's all for now" ends
+the conversation (it stays awake in the background, watching, thinking, and may still speak up);
+"go to sleep" turns everything off but the voice listener, head down, until **"Rocky, wake up"**
+(plain "Rocky" is ignored while asleep; "Rocky, wake up, what time is it" wakes it and answers);
+"louder" / "you're too loud" changes the volume; "go to the pink toy", "come here", "follow me",
+"explore", "turn left", "dance", "look up" drive and move it (PiCar-X; see Driving) -- out loud only,
+never by text. What it can't do from where you asked, it says so.
 
-| Say | Does |
-|---|---|
-| **be quiet** / "Rocky, quiet" / stop session | ends the conversation. Rocky stays awake in the background -- watching, thinking, following faces -- and may still speak up on its own. "Rocky" starts a new one. |
-| **go to sleep** | everything off except the voice listener: camera, thinking, face-following, sensors and reflexes (cliff safety too), head down. Only the nightly memory review still runs. **Only "Rocky, wake up" wakes it** -- plain "Rocky" is ignored while asleep. Waking alone just brings it back to awake-in-the-background (one sleepy word, no conversation); "Rocky, wake up, what time is it" wakes it and answers. |
-| **louder** / **softer** | speaker volume (15% steps; remembered across reboots) |
-| **go to the <thing>** / **come here** / **follow me** / **explore** / **stop** | drive (PiCar-X; see Driving). Only these exact phrases drive -- texts never do. |
-
-Commands also work said over Rocky while it's talking. The mind pauses only
+Three reflexes skip the thinking: "stop" / "wait" while it drives stops the wheels at once (the
+decision a second later only says so), talking over it cuts its speech off, and asleep it hears
+nothing but "Rocky, wake up". Measured through the real LLM (`tests/test_voice_skills.py`, 32
+things said x 3): 96/96 -- including the talk the old phrase lists had to learn to ignore
+("welcome back", "my back hurts", "do you like to dance?"). The mind pauses only
 while someone's actually talking (`state.conversation_active`: speech in the
 last 2 min), so an open-but-idle session doesn't freeze it.
 
@@ -469,12 +517,13 @@ vocabulary (gestures, `bullfight`/`fist bump` hardware behavior) stays in
 Every `common/` module has a small `assert`-based self-check:
 
 ```bash
-for m in bounded state health motor_client policy cognition mic_stream stt events sensors persona reply_schema speak_client surprise vision memory journal agenda commands faces contacts decider jev; do
+for m in bounded state health motor_client policy cognition mic_stream stt events sensors persona reply_schema speak_client surprise vision memory journal agenda skills tools faces contacts decider jev; do
   python3 -m common.$m
 done
 python3 -m personas.rocky.transform
 python3 -m personas.rocky.voice   # needs SDL_AUDIODRIVER=dummy off-Pi
 python3 -m services.chat --check  # who WhatsApp messages are answered from (needs neonize)
+python3 -m services.tasks --check # a spoken reminder is said once, the others left to theirs
 ```
 
 With `OPENBOT_BODY=none` every service except `alive` imports anywhere the
@@ -487,6 +536,10 @@ folder -- they never write into Rocky's real memory, and never move or speak:
 
 ```bash
 python3 -m tests.test_commands_turn   # voice modes through the real turn (stubbed speech/motors)
+python3 -m tests.test_voice_skills    # what's said -> the skills the real LLM picks, and what reaches the body
+python3 -m tests.test_chat_skills     # the same for texts
+python3 -m tests.test_mind_actions    # what the mind may pick (each skill's spec), and each one carried out
+python3 -m tests.test_reminders       # tasks and reminders: each reminder delivered once, by its own service
 python3 -m tests.test_listen          # listening + Mac Whisper + echo removal; prints latency
 python3 -m tests.test_reply_stream    # streamed reply + photo against the live LLM
 python3 -m tests.test_wake            # "Rocky" alone vs "Rocky, <instruction>", awake and asleep

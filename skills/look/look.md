@@ -2,8 +2,9 @@
 name: look
 description: Turn your head to look somewhere.
 where: voice, mind
-needs: body
+tool: yes
+mind: See what's around you.
 params:
-  direction (ahead|left|right|up|down): where to look
+  direction (direction, default ahead): where to look
 ---
-Use when they ask you to look somewhere, or you want to see something to one side.
+When they ask you to look somewhere: "look left", "look up at me", "move your head to the left".

@@ -15,8 +15,6 @@ from typing import Callable
 class Persona:
     name: str
     wake_words: list[str]
-    sleep_words: list[str]
-    sleep_ack: str
     # (allowed_actions, stationary_actions, gesture_guide) -> prompt. gesture_guide: "name (what it's for); ..."
     # for the stationary ones (config.describe_actions) -- the body's meanings, so the persona never names actions.
     system_prompt_template: Callable[[list[str], list[str], str], str]

@@ -1,7 +1,7 @@
 ---
 name: resolve_question
 description: Mark one of your open questions as answered.
-where: text
+where: text, voice
 params:
   number (integer): the question's number, from your open questions in the message
   answer (string): the answer, in one sentence

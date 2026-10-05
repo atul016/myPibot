@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenBot tasks (says the reminders people asked for out loud, when they're due)
+After=network-online.target openbot-speak.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=/etc/openbot/openbot.env
+ExecStart=/usr/bin/python3 -u -m services.tasks
+Restart=always
+# Listening (wake-listen, Nice=0) must win -- a reminder can wait a beat.
+Nice=5
+RestartSec=5
+NotifyAccess=main
+WatchdogSec=280
+
+[Install]
+WantedBy=multi-user.target

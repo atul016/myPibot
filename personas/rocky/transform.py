@@ -150,6 +150,9 @@ def rocky_transform(text: str) -> str:
     output = re.sub(r'\s+([.,!?])', r'\1', output)
     output = re.sub(r'\.\.+', '.', output)
     output = re.sub(r',\s*\.', '.', output)
+    # A word said thrice is emphasis; more is the LLM echoing its last (already tripled) line,
+    # which tripled again -- "scared" x3, x9, x27 on three turns in a row.
+    output = re.sub(r'\b(\w+)(?:\s+\1\b){3,}', lambda m: ' '.join(m[0].split()[:3]), output, flags=re.IGNORECASE)
 
     return output.strip()
 
@@ -159,6 +162,7 @@ def demo() -> None:
     assert "amaze amaze amaze" in rocky_transform("That is amazing!")
     assert rocky_transform("What is your name?").endswith("question?")
     assert "we bump fist" in rocky_transform("Let's fist bump")
+    assert rocky_transform("No, I'm not scared scared scared.") == "No, I not scared scared scared."  # not x9
 
 
 if __name__ == "__main__":

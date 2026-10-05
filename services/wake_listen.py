@@ -1,12 +1,13 @@
 """openbot-wake-listen: wake-word detection -> STT cascade -> one reactive
 multi-turn session that lasts until "stop session" or "go to sleep".
 
-Keeps the framework's core reliability properties: Ollama's grammar-
-constrained {reply, tone_action} schema (common/reply_schema.py) makes the
-model structurally unable to emit anything else, and movement is decided
-by deterministic keyword-match on the transcript (movement/keywords.py),
-never by the LLM -- a small local model reliably hears a move command but
-doesn't reliably request the matching action.
+A turn is three steps, like a person: decide what to do (skills.decide --
+which of its skills, skills/*/, the words ask for: driving, following,
+moving, looking, sleep, volume...), do it (each skill's muscle), then say it
+(the streamed persona reply, told exactly what was done -- so it never claims
+a move it didn't make). Only reflexes skip the thinking: "stop" while
+driving stops the wheels at once, talking over it cuts its speech, and
+asleep, only "<name>, wake up" is heard.
 
 Gestures/movement are requested from openbot-alive over a socket
 (common/motor_client.py), not dispatched locally -- this process never
@@ -35,13 +36,12 @@ import common.system  # noqa: F401 -- side effect, harmless even though this pro
 
 import config as cfg  # noqa: E402
 from common import cognition, events as dash_events, health, mic_stream, persona as persona_mod  # noqa: E402
-from common import commands, faces, journal, memory, react, reply_schema, sensors, speak_client as speak_mod, state, vision  # noqa: E402
+from common import agenda, faces, journal, memory, react, reply_schema, sensors, skills, speak_client as speak_mod, state, vision  # noqa: E402
 from common import hearing, voices  # noqa: E402
 from common.motor_client import dispatch as motor_dispatch  # noqa: E402
 from common.speak_client import speak as speak_client  # noqa: E402
 from common import stt  # noqa: E402
 from common.stt import MIC_RATE, VOSK_RATE, resample_pcm  # noqa: E402
-from movement.keywords import detect_movement_keyword, is_affirmative  # noqa: E402
 
 import vosk  # noqa: E402
 
@@ -73,13 +73,15 @@ MAX_HISTORY_MESSAGES = 16
 # No lone "quiet": Rocky's own voice through its speaker was recognized as
 # "quiet" and switched quiet mode on by itself (2026-10-02).
 INTERRUPT_PHRASES = ["stop", "wait", "hold on", "be quiet", "stop session", "go to sleep"]
+# A reflex, not a skill: said while it drives, these stop the wheels before any thinking (the
+# decide call takes ~1s; at 15cm/s that's a table edge). The decision that follows says so.
+STOP_WORDS = {"stop", "wait", "halt", "freeze", "whoa"}
 # In the wake grammar so Vosk hears the name inside them. Whether a sleeping
 # Rocky actually wakes is decided on Whisper's transcript ("wake up" in it) --
 # see _on_wake -- since the grammar forces any speech onto these phrases.
 def _wake_up_phrases(name: str) -> list[str]:
     return [f"{name} wake up", f"wake up {name}", f"hey {name} wake up"]
 
-_offered_move: str | None = None  # a wheel move the last reply offered ("want a fist bump?") -- "yes" does it
 _whisper: "stt.Whisper | stt.RemoteWhisper | None" = None  # set in the background at startup; None until then
 _wake_model = None  # set in main(); also used for the barge-in recognizer
 _voices: "voices.VoiceEngine | None" = None
@@ -207,27 +209,65 @@ def _listen(mic: mic_stream.ArecordStream, onset_timeout_s: float, seed: bytes =
     return audio, text
 
 
-def _planned_move(text: str) -> str | None:
-    """The body move this transcript triggers -- keywords decide, never the LLM."""
-    move = detect_movement_keyword(text)
-    if not move and _offered_move and is_affirmative(text):
-        move = _offered_move
-    return move if move in cfg.ALLOWED_ACTIONS else None
+def _reflex_stop(text: str) -> bool:
+    """Stop the wheels NOW if `text` says stop -- before the decide call. True if it was driving."""
+    words = stt._words(text)
+    if not (set(words) & STOP_WORDS or "hold on" in " ".join(words)):
+        return False
+    from common.motor_client import cancel_navigation
+    return cancel_navigation()
+
+
+def _plan(persona, user_text: str, history: list[dict]) -> tuple[list, list[str]]:
+    """Step 1 of a turn: which skills their words ask for (skills.decide) -- what's
+    going on around it included, so "stop" or "yes" (to a fist bump) mean something."""
+    near = sensors.read()
+    situation = "You're driving right now." if near.get("driving") else "You're standing still."
+    if near.get("distance") is not None and near["distance"] <= cfg.SAFE_DISTANCE:
+        situation += f" Something is right in front of you ({near['distance']:.0f}cm) -- probably their hand."
+    goals = agenda.open_goals(agenda.load_goals())
+    if goals:
+        situation += " Your open questions: " + " ".join(f"{i}. {g['text']}" for i, g in enumerate(goals, 1))
+    return skills.decide(cfg.LLM_BASE_URL, cfg.LLM_MODEL, "voice", cfg.CAN_DRIVE,
+                         "Someone next to you just said this to you, out loud.", situation, user_text, history)
+
+
+def _do(actions: list, refused: list[str], ctx: dict) -> list[str]:
+    """Step 2: each chosen skill's muscle; what can't be done out loud gets a reason."""
+    book = skills.load()
+    did = [r for a in actions if (r := skills.attempt(a, ctx))] + [skills.refusal(book[n], "voice") for n in refused if n in book]
+    if actions or refused:
+        dash_events.log_event("wake", f"skills: did {[a.skill for a in actions]}" + (f", not out loud: {refused}"
+                                                                                      if refused else ""))
+    return did
+
+
+def _after(ctx: dict) -> None:
+    """What a skill left for after the words (sleep: say goodnight, THEN lie down)."""
+    for step in ctx.get("after", []):
+        try:
+            step()
+        except Exception as e:
+            print(f"skills: an after-step failed: {e!r}")
 
 
 def _reply_sentences(persona, Reply, user_text: str, history: list[dict], out: dict,
-                     on_tone=lambda tone: motor_dispatch([tone]), moved: str | None = None) -> Iterator[str]:
+                     on_tone=lambda tone: motor_dispatch([tone]), did: list[str] | None = None) -> Iterator[str]:
     """Streams the reply, yielding each finished sentence (persona-transformed)
     the moment it's complete -- speech starts while the rest is still being
     generated. on_tone(gesture) is called as soon as the gesture is named (it
     streams first). Never ends in silence: an unreachable LLM yields one plain
     "can't reach my brain" line. Side-effect free otherwise (a speculative
     reply may be thrown away): fills out["text"] / out["raw"]; `history` is
-    only read -- the caller commits the exchange (_commit_history). `moved`:
-    the body move this turn triggered (it's told, so it never claims one that
-    didn't happen -- "moving forward" got said with the wheels still)."""
-    prompt = persona.system_prompt_template(cfg.ALLOWED_ACTIONS, cfg.STATIONARY_ACTIONS,
-                                            cfg.describe_actions(cfg.STATIONARY_ACTIONS))
+    only read -- the caller commits the exchange (_commit_history). `did`: what
+    this turn's skills did (step 2) -- it's told, so it never claims something
+    that didn't happen ("moving forward" got said with the wheels still). No list
+    of physical actions in the prompt: what it can do is its skills."""
+    done = ("What you did about what they said: " + " ".join(did) if did else
+            "You did nothing about what they said -- don't say you're doing anything, or about to.")
+    # in the SYSTEM prompt too: there it outweighs habit (a refused move still got "On it!" from the message alone)
+    prompt = persona.system_prompt_template([], cfg.STATIONARY_ACTIONS,
+                                            cfg.describe_actions(cfg.STATIONARY_ACTIONS)) + f"\n\nThis turn: {done}"
     called_only = not [w for w in stt._words(user_text) if w not in (_wake_name(persona), "hey", "hi", "ok", "okay")]
     # A fresh camera frame with every turn, not the mind's last look (up to 90s
     # old): "what am I holding?" got guesses ("a pen? a stylus?") without it.
@@ -247,25 +287,13 @@ def _reply_sentences(persona, Reply, user_text: str, history: list[dict], out: d
         who, by = _voice_speaker, "voice"
     if who:
         turn += f"The person talking to you is {who} (you recognize their {by}). Use their name when it fits.\n"
-    if cfg.CAN_DRIVE:
-        turn += (f"Because of what they just said, your body is doing \"{moved}\" right now -- you may say so.\n"
-                 if moved else "Nothing they just said made you move -- don't say you're moving or about to.\n")
+    turn += done + "\n"
     near = sensors.read()
     if cfg.PLAYFUL_ACTIONS and near.get("distance") is not None and near["distance"] <= cfg.SAFE_DISTANCE:
         turn += (f"Right now something is almost touching your front ({near['distance']:.0f}cm) -- probably their "
                  f"hand or fist. If it fits the moment, your tone_action may also be: "
                  f"{cfg.describe_actions(cfg.PLAYFUL_ACTIONS)}.\n")
-    conversation_prompt = journal.inject(
-        turn +
-        "You can't switch your own modes by agreeing to -- only these exact spoken commands do: "
-        f"\"be quiet\" (ends this conversation), \"go to sleep\" (everything off until \"{persona.name}, wake up\"). "
-        "If they seem to want one of those, tell them the words to say instead of promising it. " +
-        ("You drive only on these exact spoken commands: \"go to the <thing>\", \"come here\", "
-         "\"follow me\", \"explore\", \"stop\" (and simple forward/back/turn). Never claim you're driving otherwise -- "
-         "tell them the words. " if cfg.CAN_DRIVE else
-         "You have no wheels or arms: you can't move at all, so never claim you're moving. ") +
-        "You can't press buttons or pick things up.\n\n"
-        f"User transcript: {user_text}", query=user_text)
+    conversation_prompt = journal.inject(turn + f"\nUser transcript: {user_text}", query=user_text)
     rs, raw, gestured = reply_schema.ReplyStream(), "", False
     for delta in cognition.stream(cfg.LLM_BASE_URL, cfg.LLM_MODEL, conversation_prompt, system=prompt,
                                   json_schema=Reply.model_json_schema(), history=history, image_jpeg=photo):
@@ -301,6 +329,8 @@ class _Speculation:
 
     def __init__(self, persona, Reply, audio: bytes, heard_from: float, history: list[dict]):
         self.text = ""
+        self.plan: tuple[list, list[str]] | None = None  # step 1 (decide), done ahead: side-effect free
+        self._planned = threading.Event()
         self.whisper_answered = False  # True: an empty text is Whisper's verdict, not "couldn't ask"
         self.out: dict = {}
         self._cancelled = threading.Event()
@@ -323,10 +353,15 @@ class _Speculation:
             self._transcribed.set()
         reply = None
         try:
-            if not self.text or self._cancelled.is_set() or commands.parse(self.text):
-                return  # nothing to answer, or a command -- the turn handles those itself
-            reply = _reply_sentences(persona, Reply, self.text, history, self.out, on_tone=self._on_tone,
-                                     moved=_planned_move(self.text))
+            if not self.text or self._cancelled.is_set():
+                return
+            try:
+                self.plan = _plan(persona, self.text, history)
+            finally:
+                self._planned.set()
+            if self._cancelled.is_set() or self.plan[0] or self.plan[1]:
+                return  # something to DO: never ahead of time -- the turn does it, then replies
+            reply = _reply_sentences(persona, Reply, self.text, history, self.out, on_tone=self._on_tone, did=[])
             for sentence in reply:
                 if self._cancelled.is_set():
                     break
@@ -360,6 +395,12 @@ class _Speculation:
 
     def ready_for(self, text: str) -> bool:
         return bool(text) and text == self.text and not self._cancelled.is_set()
+
+    def plan_for(self, text: str, timeout_s: float = 15.0) -> tuple[list, list[str]] | None:
+        """The decision made ahead for exactly these words, or None (the turn decides itself)."""
+        if not self.ready_for(text) or not self._planned.wait(timeout_s):
+            return None
+        return self.plan
 
     def commit(self, out: dict) -> Iterator[str]:
         """The held reply as a live sentence stream; fires the gesture now."""
@@ -452,36 +493,6 @@ def _say_line(persona, situation: str, fallback: str, mic: mic_stream.ArecordStr
     _speak_interruptible(persona, [spoken], mic)
 
 
-def _do_navigation(persona, nav: tuple[str, str | None], mic: mic_stream.ArecordStream) -> bool:
-    """Starts or stops a drive (it runs in openbot-alive -- movement/navigate.py,
-    proven in sim/ first -- and Rocky says how it went). The conversation goes on."""
-    from common.motor_client import cancel_navigation, navigate
-    kind, target = nav
-    if not cfg.CAN_DRIVE:
-        _say_line(persona, "They asked you to drive somewhere, but you have no wheels -- you can't move at all.",
-                  "I can't move -- I don't have wheels.", mic)
-        return True
-    if kind == "stop":
-        _say_line(persona, "They said stop -- you've just stopped driving." if cancel_navigation()
-                  else "They said stop, but you weren't moving anyway.", "Okay.", mic)
-        return True
-    ok, err = navigate({"follow": True} if kind == "follow" else {"approach": target} if kind == "approach"
-                       else {"explore": 60})
-    if not ok:
-        _say_line(persona, "They asked you to drive somewhere, but you're already on your way somewhere -- "
-                  "they'd have to say stop first." if "already" in err
-                  else "They asked you to drive somewhere, but your wheels aren't answering right now.",
-                  "I can't drive right now.", mic)
-        return True
-    journal.log("did", "started following them" if kind == "follow"
-                else f"started driving {'to the ' + target if target else 'around to explore'}")
-    _say_line(persona, "They said follow me, and you've just started following them." if kind == "follow"
-              else "They said come here, and you've just set off toward them." if target == "person"
-              else f"They asked you to go to the {target}, and you've just set off toward it." if target
-              else "They told you to go explore, and you've just set off.", "Okay!", mic)
-    return True
-
-
 def _wake_up(persona, mic: mic_stream.ArecordStream) -> None:
     """"Rocky, wake up" with nothing after it: awake in the background -- camera,
     mind and reflexes resume on the cleared flag -- and one sleepy word, no session."""
@@ -498,60 +509,46 @@ REMOTE_FRESH_S = 60.0  # a texted command older than this (wake-listen was down)
 
 
 def _do_remote(persona, mic: mic_stream.ArecordStream, in_session: bool) -> bool:
-    """A mode skill used by text on WhatsApp (skills sleep, wake_up,
-    end_conversation, volume -- session["remote_command"]), carried out as if
-    it had just been said. Returns whether the conversation (if any) goes on."""
+    """A skill used by text on WhatsApp that happens here (session["remote_command"]
+    = {"skill": sleep | end_conversation | volume | wake_up, ...params}), done as
+    if it had just been said: its spoken muscle, then a line about it. Returns
+    whether the conversation (if any) goes on."""
     s = state.load_session()
     cmd = s.get("remote_command")
     if not cmd:
         return True
     state.update_session({"remote_command": None})
-    if time.time() - s.get("remote_command_ts", 0) > REMOTE_FRESH_S:
+    if time.time() - s.get("remote_command_ts", 0) > REMOTE_FRESH_S or not isinstance(cmd, dict):
         return True
-    dash_events.log_event("wake", f"texted command: {cmd}")
-    if cmd == commands.WAKE and s.get("asleep"):
-        _wake_up(persona, mic)
-    elif (cmd == commands.SLEEP and not s.get("asleep")) or (cmd == commands.STOP_SESSION and in_session) \
-            or cmd in (commands.LOUDER, commands.SOFTER):
-        return _do_command(persona, cmd, mic)
-    return True
+    dash_events.log_event("wake", f"texted: {cmd}")
+    name, params = cmd.get("skill"), {k: v for k, v in cmd.items() if k != "skill"}
+    if name == "wake_up":
+        if s.get("asleep"):
+            _wake_up(persona, mic)
+        return True
+    if name == "end_conversation" and not in_session:
+        return True
+    ctx = {"channel": "voice", "who": None}
+    did = skills.use(name, ctx, params)
+    if did:
+        _say_line(persona, f"They texted you to do this, and you just did it: {did}", "Okay.", mic)
+    _after(ctx)
+    return not ctx.get("end_session")
 
 
-def _do_command(persona, cmd: str, mic: mic_stream.ArecordStream) -> bool:
-    """Carries out a mode command. Returns whether the session continues."""
-    if cmd in (commands.STOP_SESSION, commands.SLEEP):
-        from common.motor_client import cancel_navigation
-        cancel_navigation()  # never keep driving after "be quiet" / "go to sleep"
-    if cmd == commands.STOP_SESSION:  # "be quiet" / "stop session"
-        journal.log("did", "ended the conversation (asked to be quiet) -- still around in the background")
-        _say_line(persona, f"They asked you to be quiet: this conversation is over, but you'll still be around, and "
-                  f"saying \"{persona.name}\" starts a new one. Acknowledge that briefly.",
-                  "Okay. Say my name if you need me.", mic)
-        return False
-    if cmd == commands.SLEEP:
-        _say_line(persona, f"They told you to go to sleep -- everything switches off until they say "
-                  f"\"{persona.name}, wake up\". Say a short, sleepy goodnight.", persona.sleep_ack, mic)
-        state.update_session({"asleep": True})
-        motor_dispatch(["look down"], wait=True)  # head down: visibly asleep
-        journal.log("did", f"went to sleep -- everything off, listening only for \"{persona.name}, wake up\"")
-        dash_events.log_event("wake", "went to sleep")
-        return False
-    if cmd in (commands.LOUDER, commands.SOFTER):
-        from common.system import get_volume, set_volume
-        current = get_volume() or 100
-        target = current + (15 if cmd == commands.LOUDER else -15)
-        if cmd == commands.LOUDER and current >= 100:
-            _say_line(persona, "They asked you to speak louder, but you're already at full volume.",
-                      "I'm already as loud as I go!", mic)
-            return True
-        new = set_volume(target)
-        state.update_session({"volume": new})  # openbot-speak re-applies it after a reboot
-        journal.log("did", f"volume {current}% -> {new}%")
-        _say_line(persona, f"They asked you to speak {'louder' if cmd == commands.LOUDER else 'softer'}, and you "
-                  f"just turned your volume {'up' if cmd == commands.LOUDER else 'down'} to {new}%. Acknowledge it.",
-                  "Louder now!" if cmd == commands.LOUDER else "Softer now.", mic)
+def _handle_cut(persona, cut_by: str, history: list[dict], mic: mic_stream.ArecordStream) -> bool:
+    """They talked over it (its speech is already cut -- a reflex): the wheels stop if
+    they said stop, then what they said is decided on like any turn. "Wait" alone:
+    nothing to do -- they have the floor. Returns whether the conversation goes on."""
+    stopped = _reflex_stop(cut_by)
+    actions, refused = _plan(persona, cut_by, history)
+    if not actions and not refused:
         return True
-    return True
+    ctx = {"channel": "voice", "who": None, "stopped": stopped}
+    did = _do(actions, refused, ctx)
+    _say_line(persona, " ".join(did) + " Say so in a few words.", "Okay.", mic)
+    _after(ctx)
+    return not ctx.get("end_session")
 
 
 def _learn_voice(who: str, pcm16k: bytes) -> None:
@@ -574,12 +571,18 @@ def _whose_voice(pcm16k: bytes) -> str | None:
 def _run_turn(persona, Reply, user_text: str, history: list[dict],
               mic: mic_stream.ArecordStream, spec: "_Speculation | None" = None,
               audio: bytes = b"") -> tuple[bool, bool]:
-    """One exchange. Returns (continue_session, interrupted) -- continue is
-    False after "stop session" or "go to sleep"; interrupted is True if the
-    person talked over the reply. `audio`: what they said, for voices."""
-    global _offered_move, _voice_speaker
+    """One exchange, in three steps like a person: decide what to do (_plan --
+    skills.decide; usually already done during the pause, by `spec`), do it
+    (_do: each skill's muscle), then say it (_reply_sentences, told what was
+    done -- with nothing to do, the reply `spec` wrote ahead is used). "Stop"
+    while driving stops the wheels first, as a reflex. Returns (continue_session,
+    interrupted) -- continue is False once a skill ended it (end_conversation,
+    sleep); interrupted is True if the person talked over the reply. `audio`:
+    what they said, for voices."""
+    global _voice_speaker
     state.update_session({"last_heard": user_text, "last_heard_ts": time.time(), "last_activity_ts": time.time()})
     dash_events.log_event("wake", f"user: {user_text}")
+    stopped = _reflex_stop(user_text)  # the wheels before the thinking
     who = faces.speaker(faces.read())
     _voice_speaker = None
     if audio and _voices is not None:
@@ -595,52 +598,35 @@ def _run_turn(persona, Reply, user_text: str, history: list[dict],
 
     _learn_face(user_text)
 
-    cmd = commands.parse(user_text, extra_sleep=persona.sleep_words)
-    if cmd:
+    plan = spec.plan_for(user_text) if spec is not None else None
+    if plan is None:
         if spec is not None:
             spec.cancel()
-        dash_events.log_event("wake", f'"{user_text}" -> {cmd}')
-        return _do_command(persona, cmd, mic), False
-
-    nav = commands.navigation(user_text)  # after mode commands: "go to sleep" isn't a destination
-    if nav and (cfg.CAN_DRIVE or nav[0] != "stop"):  # no wheels: a bare "stop"/"wait" is just talk
-        if spec is not None:
-            spec.cancel()
-        dash_events.log_event("wake", f'"{user_text}" -> drive {nav}')
-        return _do_navigation(persona, nav, mic), False
-
-    move_action = _planned_move(user_text)
-    if move_action:
-        # Queued, not awaited: the words come WITH the move ("watch me dance" while dancing), not
-        # after it. dispatch() still reports whether the body accepted it (down, or mid-drive).
-        if motor_dispatch([move_action]):
-            journal.log("did", f"moved: {move_action}")
-            dash_events.log_event("wake", f'"{user_text}" -> move {move_action}')
-        else:  # alive down or mid-drive: a reply written ahead must not claim the move
-            move_action = None
-            if spec is not None:
-                spec.cancel()
-
+            spec = None
+        plan = _plan(persona, user_text, history)
+    actions, refused = plan
+    ctx = {"channel": "voice", "who": who, "stopped": stopped}
     out: dict = {}
-    if spec is not None and spec.ready_for(user_text):
-        sentences = spec.commit(out)  # already written while we waited out the pause
-    else:
+    if actions or refused:
         if spec is not None:
             spec.cancel()
-        sentences = _reply_sentences(persona, Reply, user_text, history, out, moved=move_action)
+        sentences = _reply_sentences(persona, Reply, user_text, history, out, did=_do(actions, refused, ctx))
+    elif spec is not None and spec.ready_for(user_text):
+        sentences = spec.commit(out)  # nothing to do, and the words were already written during the pause
+    else:
+        sentences = _reply_sentences(persona, Reply, user_text, history, out, did=[])
     spoken, cut_by = _speak_interruptible(persona, sentences, mic)
+    _after(ctx)
     _commit_history(history, user_text, out)
-    said = out.get("text", "").lower()
-    _offered_move = next((a for a in cfg.PLAYFUL_ACTIONS if a in said), None)
     dash_events.log_event("reply", f"llm response: {spoken}")
     journal.log("said", spoken)
     state.update_session({"last_activity_ts": time.time()})
+    if ctx.get("end_session"):
+        return False, False
     if cut_by:
         journal.log("interrupted", f"they cut me off: {cut_by!r}")
-        cmd = commands.parse(cut_by)  # "be quiet" / "stop session" / "go to sleep" said over me
-        if cmd:
-            return _do_command(persona, cmd, mic), False
-    return True, bool(cut_by)
+        return (True, True) if _handle_cut(persona, cut_by, history, mic) else (False, False)
+    return True, False
 
 
 def _learn_face(user_text: str) -> None:
@@ -740,7 +726,7 @@ def _run_session(persona, Reply, mic: mic_stream.ArecordStream, first_text: str 
             journal.log("said", greeting)
             _, cut_by = _speak_interruptible(persona, [greeting], mic)
             interrupted = bool(cut_by)
-            if cut_by and (cmd := commands.parse(cut_by)) and not _do_command(persona, cmd, mic):
+            if cut_by and not _handle_cut(persona, cut_by, history, mic):
                 return
 
         while True:
@@ -751,7 +737,7 @@ def _run_session(persona, Reply, mic: mic_stream.ArecordStream, first_text: str 
             audio, text = _listen(mic, 60.0, speculate=lambda audio, heard_from: _Speculation(
                 persona, Reply, audio, heard_from, history), spec_out=spec_out,
                 stop=lambda: bool(state.load_session().get("remote_command")))
-            if not _do_remote(persona, mic, in_session=True):  # texted /be-quiet or /go-to-sleep
+            if not _do_remote(persona, mic, in_session=True):  # texted: end the conversation, or sleep
                 break
             if not text:
                 interrupted = False  # nothing heard in a minute -> just keep listening

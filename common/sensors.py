@@ -18,12 +18,14 @@ MOTION_PATH = STATE_DIR / "motion.json"
 
 def publish(distance: float | None, grayscale: list | None, latches: dict[str, bool],
             battery_v: float | None = None, battery_pct: float | None = None, driving: bool = False,
-            head: dict | None = None) -> None:
+            head: dict | None = None, imu: dict | None = None) -> None:
     """head: {"pan", "tilt", "moved_ts"} -- where the camera points (pan + = right, tilt + = up)
-    and when it last moved: its own glances must not read as the room changing."""
+    and when it last moved: its own glances must not read as the room changing.
+    imu: common/imu.py's Tracker.snapshot() -- None without an IMU."""
     atomic_write(SENSORS_PATH, json.dumps({
         "distance": distance, "grayscale": grayscale, "latches": latches,
-        "battery_v": battery_v, "battery_pct": battery_pct, "driving": driving, "head": head, "ts": time.time(),
+        "battery_v": battery_v, "battery_pct": battery_pct, "driving": driving, "head": head, "imu": imu,
+        "ts": time.time(),
     }))
 
 

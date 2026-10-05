@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import time
 from urllib.parse import quote
 
@@ -96,14 +97,23 @@ def lookup(topic: str) -> str | None:
 
 
 def remind_time(hhmm: str, now: dt.datetime | None = None) -> float | None:
-    """"18:30" -> the next time it's 18:30 (today, or tomorrow if that's passed), as a timestamp."""
+    """"18:30" -> the next time it's 18:30 (today, or tomorrow if that's passed), as a timestamp.
+    A time that could be either half of the day ("2:37", "5:00" -- no am/pm, hour 1-12) is the
+    sooner of the two: "remind me at 2:37" said at 14:35 got 2:37 AM (2026-10-04).
+    "in 20 minutes" / "in 2 hours": from now -- the deciding LLM has no clock to add it up."""
     now = now or dt.datetime.now()
+    later = re.fullmatch(r"in (\d+) (minute|hour)s?", hhmm.strip().lower())
+    if later:
+        return (now + dt.timedelta(**{f"{later[2]}s": int(later[1])})).timestamp()
     try:
         t = dt.datetime.strptime(hhmm.strip(), "%H:%M").time()
     except ValueError:
         return None
-    at = dt.datetime.combine(now.date(), t)
-    return (at if at > now else at + dt.timedelta(days=1)).timestamp()
+    next_at = lambda tt: (lambda at: at if at > now else at + dt.timedelta(days=1))(dt.datetime.combine(now.date(), tt))  # noqa: E731
+    at = next_at(t)
+    if 1 <= t.hour <= 12 and not hhmm.strip().startswith("0"):  # "02:37" is meant as night
+        at = min(at, next_at(t.replace(hour=(t.hour + 12) % 24)))
+    return at.timestamp()
 
 
 def demo() -> None:
@@ -111,7 +121,15 @@ def demo() -> None:
     assert now_words(now) == "Saturday, October 3, 8:15 PM"
     assert remind_time("21:00", now) == dt.datetime(2026, 10, 3, 21, 0).timestamp()
     assert remind_time("6:30", now) == dt.datetime(2026, 10, 4, 6, 30).timestamp()  # already past: tomorrow
+    afternoon = dt.datetime(2026, 10, 4, 14, 35)
+    assert remind_time("2:37", afternoon) == dt.datetime(2026, 10, 4, 14, 37).timestamp()  # the sooner 2:37
+    assert remind_time("14:37", afternoon) == dt.datetime(2026, 10, 4, 14, 37).timestamp()
+    assert remind_time("02:37", afternoon) == dt.datetime(2026, 10, 5, 2, 37).timestamp()  # written as night
+    assert remind_time("9:00", dt.datetime(2026, 10, 4, 8, 0)) == dt.datetime(2026, 10, 4, 9, 0).timestamp()
     assert remind_time("soon", now) is None
+    assert remind_time("in 10 minutes", now) == dt.datetime(2026, 10, 3, 20, 25).timestamp()
+    assert remind_time("In 2 hours", now) == remind_time("in 120 minutes", now) == dt.datetime(2026, 10, 3, 22, 15).timestamp()
+    assert remind_time("in a while", now) is None
     line = weather_line({"current": {"temperature_2m": 57.9, "weather_code": 0, "wind_speed_10m": 3.0},
                          "daily": {"temperature_2m_min": [50, 45], "temperature_2m_max": [70.6, 62],
                                    "weather_code": [1, 61], "precipitation_probability_max": [0, 80]}})
