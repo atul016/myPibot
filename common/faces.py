@@ -244,9 +244,22 @@ def head_step(face_box: list[int], frame_wh: tuple[int, int], pan: float, tilt: 
     return round(new_pan, 1), round(new_tilt, 1)
 
 
+def person_target(box: list[float], pan: float, tilt: float) -> tuple[float, float]:
+    """Where to point the head at a person the object detector sees but whose face it doesn't:
+    the middle of their box across, near its top -- where the face is (from the floor it's often
+    above the frame, so the head tips up toward it). box: [left, top, right, bottom], fractions."""
+    left, top, right, bottom = box
+    ex, ey = (left + right) / 2 - 0.5, top + 0.1 * (bottom - top) - 0.5
+    return (round(max(-PAN_LIMIT, min(PAN_LIMIT, pan + ex * FOV_DEG[0])), 1),
+            round(max(-TILT_LIMIT, min(TILT_LIMIT, tilt - ey * FOV_DEG[1])), 1))
+
+
 def demo() -> None:
     import shutil, tempfile
     import numpy as np
+    assert person_target([0.4, 0.0, 0.6, 1.0], 0, 0) == (0.0, 16.4)      # straight ahead, head cut off: tip up
+    assert person_target([0.7, 0.2, 0.9, 1.0], 10, 5) == (26.2, 14.0)    # to the right
+    assert person_target([0.9, 0.0, 1.0, 1.0], 50, 0)[0] == PAN_LIMIT    # past the servo's reach: as far as it goes
     assert speaker({"faces": [{"name": "atul-p"}]}) == "Atul P"
     assert speaker({"faces": [{"name": "atul"}, {}]}) is None  # a stranger too: whose voice? a guess
     assert speaker({"faces": [{}]}) is None and speaker({}) is None

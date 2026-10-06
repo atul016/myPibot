@@ -17,9 +17,13 @@ RATE = 44100
 def isolate_state() -> str:
     """Point OpenBot's state/ at a throwaway folder. Call BEFORE importing any
     OpenBot module (state.STATE_DIR is read at import time) -- a test must
-    never write into Rocky's real memory, journal or session."""
+    never write into Rocky's real memory, journal or session. Nor move or speak
+    through the real robot: its body and voice sockets point nowhere, so a call
+    a test forgot to stub fails instead (a turn's glance toward a voice once could)."""
     path = tempfile.mkdtemp(prefix="openbot-test-")
     os.environ["OPENBOT_STATE_DIR"] = path
+    os.environ["OPENBOT_ALIVE_SOCK"] = os.path.join(path, "no-openbot-alive.sock")
+    os.environ["OPENBOT_SPEAK_SOCK"] = os.path.join(path, "no-openbot-speak.sock")
     return path
 
 

@@ -33,7 +33,13 @@ DEFAULT_SESSION: dict[str, Any] = {
     "remote_command": None,  # {"skill": sleep|end_conversation|volume|wake_up, ...} used by text: wake-listen does it
     "text_out": None,  # a WhatsApp text the mind decided on, for openbot-chat to send
     "texts_paused_until": {},  # number ("*": everyone) -> unix time: don't text them first till then (skills/pause_texting)
+    "text_floor_s": {},  # number -> seconds between the texts the mind starts: doubles while they don't answer (mind.py)
 }
+
+# The mind texts someone first at most once per TEXT_FLOOR_S; each text they leave unanswered doubles
+# the wait (up to TEXT_FLOOR_MAX_S), any message from them sets it back. Summary, dream and reminder
+# texts (openbot-chat's own) are outside this.
+TEXT_FLOOR_S, TEXT_FLOOR_MAX_S = 600, 7200
 
 # A session stays open until "stop session" -- but the mind shouldn't stay
 # frozen behind a session nobody has spoken in for a while.
@@ -135,6 +141,17 @@ def texting_paused(number: str, session: dict | None = None) -> bool:
     return time.time() < max(paused.get(number, 0), paused.get("*", 0))
 
 
+def text_floor(number: str, session: dict | None = None) -> int:
+    """Seconds the mind waits before texting `number` first again."""
+    floors = (session if session is not None else load_session()).get("text_floor_s") or {}
+    return int(floors.get(number, TEXT_FLOOR_S))
+
+
+def reset_text_floor(number: str) -> None:
+    """They texted: the back-off for them starts over at TEXT_FLOOR_S."""
+    change_session("text_floor_s", lambda f: {k: v for k, v in (f or {}).items() if k != number})
+
+
 def mark_self_noise() -> None:
     """Stamps "the robot itself just made sound/motion" -- openbot-mind
     ignores loudness/vision surprises for a few seconds after this, or
@@ -157,6 +174,17 @@ def demo() -> None:
         assert load_session()["persona"] == "test"
         assert change_session("todo", lambda v: (v or []) + ["milk"]) == ["milk"]
         assert change_session("todo", lambda v: v + ["eggs"]) == ["milk", "eggs"] == load_session()["todo"]
+        # skills/pause_texting writes the sender's number as openbot-chat gives it: digits only, like CHAT_ALLOW's
+        allow = {"".join(filter(str.isdigit, "+91 98765 43210")), "15550100"}
+        update_session({"texts_paused_until": {"919876543210": time.time() + 60, "15550100": time.time() - 1}})
+        assert texting_paused("919876543210") and not texting_paused("15550100") and not texting_paused("7")
+        update_session({"texts_paused_until": {"*": time.time() + 60}})
+        assert all(texting_paused(n) for n in allow)
+        assert text_floor("15550100") == TEXT_FLOOR_S
+        update_session({"text_floor_s": {"15550100": 2400}})
+        assert text_floor("15550100") == 2400 and text_floor("919876543210") == TEXT_FLOOR_S
+        reset_text_floor("15550100")
+        assert text_floor("15550100") == TEXT_FLOOR_S
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)
 

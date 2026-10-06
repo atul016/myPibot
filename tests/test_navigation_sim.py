@@ -20,6 +20,7 @@ from movement import navigate
 from sim.world import FRONT_REACH, SimBody, World
 
 TRUE_ARRIVAL_CM = 35  # a "reached it" must end with the bumper this close to the target's centre
+TURN_OFF_DEG = 25  # a turn that says "facing them" must really be this close to the way they asked
 FOLLOW_NEAR_CM = 120  # a follow that ran its course must end with the bumper this close to the person's centre
 
 SEEDS = 25
@@ -32,8 +33,11 @@ def run(path: Path, seed: int):
     world, spec = World.load(path, seed)
     body = SimBody(world)
     task = spec["task"]
+    world.start_heading = body.heading()
     if "approach" in task:
         outcome = navigate.approach(body, task["approach"])
+    elif "turn" in task:
+        outcome = navigate.turn_by(body, task["turn"])
     elif "follow" in task:
         outcome = navigate.follow(body, task["follow"])
     else:
@@ -65,6 +69,9 @@ def main(names: list[str]) -> None:
                 person = next(o for o in world.obstacles if o.label == "person")
                 fx, fy = world.pose.point(FRONT_REACH)
                 false_claims += math.hypot(fx - person.x, fy - person.y) > FOLLOW_NEAR_CM
+            if outcome.done and "turn" in spec["task"]:
+                turned = -math.degrees(world.pose.h) - world.start_heading
+                false_claims += abs((turned - spec["task"]["turn"] + 180) % 360 - 180) > TURN_OFF_DEG
             reasons[outcome.reason] = reasons.get(outcome.reason, 0) + 1
             steps.append(outcome.steps)
             if seed == 0:
@@ -85,6 +92,26 @@ def main(names: list[str]) -> None:
             failures.append(f"{path.stem}: reached only {reached}/{SEEDS}")
         if expect == "refuse" and reached:
             failures.append(f"{path.stem}: claimed to reach an unreachable target {reached}x")
+    if not names or any(n.startswith("turn") for n in names):  # an IMU set up backwards: stop, never spin round
+        class Backwards(SimBody):
+            def heading(self):
+                return -super().heading()
+        for seed in range(10):
+            world, _ = World.load(HERE / "sim" / "scenarios" / "turn_floor.json", seed)
+            h0 = world.pose.h
+            out = navigate.turn_by(Backwards(world), 120)
+            if out.done or out.steps > 2 or abs(math.degrees(world.pose.h - h0)) > 45:
+                failures.append(f"turn with a backwards heading (seed {seed}): {out}, "
+                                f"turned {math.degrees(world.pose.h - h0):.0f} degrees")
+
+        class Frozen(SimBody):  # an IMU that stopped -- or wheels that don't turn him: stop soon, not 16 moves on
+            def heading(self):
+                return 0.0
+        for seed in range(10):
+            world, _ = World.load(HERE / "sim" / "scenarios" / "turn_floor.json", seed)
+            out = navigate.turn_by(Frozen(world), 120)
+            if out.done or out.steps > navigate.FACE_STALLED_MOVES:
+                failures.append(f"turn with a frozen heading (seed {seed}): {out}")
     print(f"pictures: {OUT}/")
     assert not failures, "\n".join(failures)
     print("test_navigation_sim: ok")

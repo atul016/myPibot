@@ -1,0 +1,3 @@
+{"description": "Someone calls from his right on the floor: turn about 120 degrees where he stands -- a three-point turn, watching the IMU's heading.",
+ "table": [0, 0, 300, 250], "robot": [150, 125, 0],
+ "task": {"turn": 120}, "expect": "reach"}

@@ -52,8 +52,9 @@ def _decode(jpeg: bytes):
 
 
 class RealBody:
-    def __init__(self, car, monitor, cfg, cancel: threading.Event):
+    def __init__(self, car, monitor, cfg, cancel: threading.Event, heading=None):
         self.car, self.monitor, self.cfg, self.cancel = car, monitor, cfg, cancel
+        self._heading = heading         # () -> the IMU's heading (openbot-alive's), or None without one
         self.pan = 0.0
         self.tilt = DRIVE_TILT          # navigate.follow looks up instead (alive sets FOLLOW_TILT)
         self.settled = 0.0              # when the head last stopped moving
@@ -61,6 +62,10 @@ class RealBody:
 
     def cancelled(self) -> bool:
         return self.cancel.is_set()
+
+    def heading(self) -> float | None:
+        """Degrees turned, + right -- the IMU (navigate.turn_by)."""
+        return self._heading() if self._heading else None
 
     def distance(self) -> float | None:
         return self.monitor.current_distance()  # median of the last 5 reads (see triggers.smoothed_distance)

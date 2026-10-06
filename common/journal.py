@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import time
 from pathlib import Path
 
 from filelock import FileLock, Timeout as FileLockTimeout
@@ -34,9 +35,24 @@ def _day_path(day: dt.date) -> Path:
     return memory.MIND_DIR / "journal" / f"{day.isoformat()}.md"
 
 
+# Words just forgotten (skills/forget), in this process's RAM only, for SCRUB_S: the turn that
+# erased them journals its own reply right after -- which named them, live, 1 time in 2.
+SCRUB_S = 600
+_scrub: dict[str, float] = {}
+
+
+def scrub(term: str) -> None:
+    _scrub[term.lower()] = time.time() + SCRUB_S
+
+
 def log(kind: str, text: str, now: dt.datetime | None = None) -> None:
     """Best-effort: a failed journal write must never break the caller."""
     now = now or dt.datetime.now()
+    for term, until in list(_scrub.items()):
+        if until < time.time():
+            del _scrub[term]
+        else:
+            text = re.sub(rf"(?<!\w){re.escape(term)}(?!\w)", "[forgotten]", text, flags=re.IGNORECASE)
     line = f"- [{memory.slug(kind)[:20]}] {now:%H:%M} {memory.one_line(text, 400)}\n"
     try:
         with FileLock(str(LOCK_PATH), timeout=5):
@@ -164,6 +180,10 @@ def demo() -> None:
         write_summary(t.date(), "Quiet night, then the lights went out.")
         assert read_summary(t.date()) == "Quiet night, then the lights went out."
         assert read_summary(dt.date(2000, 1, 1)) == ""
+        scrub("Anna")  # just forgotten: the reply that follows can't write it back
+        log("said", "All of anna's notes are gone", now=dt.datetime(2026, 10, 5, 9, 0))
+        _scrub.clear()
+        assert entries(dt.date(2026, 10, 5)) == ["[said] 09:00 All of [forgotten]'s notes are gone"]
         assert last_conversation(t) == ("yesterday", ["[heard] 23:58 rocky what time is it", "[said] 23:58 late! second line"])
         log("heard", "morning", now=dt.datetime(2026, 10, 2, 9, 0))
         assert last_conversation(dt.datetime(2026, 10, 2, 9, 30)) == ("earlier today", ["[heard] 09:00 morning"])

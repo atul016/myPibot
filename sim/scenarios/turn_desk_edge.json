@@ -1,0 +1,3 @@
+{"description": "On a desk, the edge just ahead: turn 90 degrees right without going over -- the arcs stop at the edge and back up over ground just driven.",
+ "table": [0, 0, 120, 75], "robot": [88, 37, 0],
+ "task": {"turn": 90}, "expect": "reach"}

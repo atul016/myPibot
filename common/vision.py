@@ -34,6 +34,9 @@ TUNING_FILE = os.environ.get("OPENBOT_CAMERA_TUNING", "/usr/share/libcamera/ipa/
 # invents colors ("reddish-brown"... then "purple"), which read as fake
 # scene changes all night. Calibration knob for this camera/room.
 DARK_BRIGHTNESS = 40  # measured: pitch-dark room reads ~25 at max auto-gain
+# Mean brightness differing this much from the last look the same way: the light changed (a lamp, the
+# sun), so what the model calls new objects is reported as light, not as things appearing.
+LIGHT_CHANGE = 40
 DARK_SCENE = "It's too dark to see anything."
 # A look is compared only with the last one from about the same ROOM direction (where the body faces
 # + where the head points), in steps this wide: the head follows faces (up to 60 deg) and glances
@@ -172,15 +175,17 @@ def look(base_url: str, model: str, direction: str = "ahead",
         head = (h.get("pan", 0.0), h.get("tilt", 0.0))
     record = last_look()
     heading, lost = record.get("heading", 0.0), record.get("lost")
-    prev = "" if lost else record.get("views", {}).get(view_key(heading + head[0], head[1]), "")
-    if brightness(jpeg) < DARK_BRIGHTNESS:
+    key = view_key(heading + head[0], head[1])
+    prev = "" if lost else record.get("views", {}).get(key, "")
+    light = brightness(jpeg)
+    if light < DARK_BRIGHTNESS:
         changed = bool(prev) and prev != DARK_SCENE
         return _save({"scene": DARK_SCENE, "changed": changed, "kind": "lights_off",
                       "what_changed": "the lights went out" if changed else "", "direction": direction, "head": head},
-                     heading, lost)
+                     heading, lost, light)
     from . import objects  # deferred: objects -> faces is heavier than this module needs at import
     detected = objects.names(objects.read())
-    prompt = ("You are a small desk robot looking through your camera "
+    prompt = ("You are a small home robot looking through your camera "
               f"({head_words(*head)}). Describe what you see in one short, concrete sentence. "
               + (f"Your object detector sees {detected} -- trust it over guesses. " if detected else "") +
               "Your camera has no infrared filter, so black or dark things (clothes, hair, shadows) "
@@ -198,9 +203,13 @@ def look(base_url: str, model: str, direction: str = "ahead",
         return None
     if prev == DARK_SCENE:  # the model can't compare against a frame it never saw
         return _save({"scene": str(data.get("scene", "")), "changed": True, "kind": "lights_on",
-                      "what_changed": "the lights came on", "direction": direction, "head": head}, heading, lost)
+                      "what_changed": "the lights came on", "direction": direction, "head": head}, heading, lost, light)
     out = {"scene": str(data.get("scene", "")), "changed": bool(data.get("changed")) and bool(prev),
            "kind": "scene", "what_changed": str(data.get("what_changed", "")), "direction": direction, "head": head}
+    lit = light_change(record.get("view_light", {}).get(key) if prev else None, light)
+    if lit:
+        out.update(changed=True, kind=lit, what_changed=f"the light {'came up' if lit == 'lights_on' else 'went down'} "
+                   "-- things may only look different, not be different")
     if lost:
         found = _find_bearings(base_url, model, out["scene"], head, record.get("views", {}))
         if found is not None:
@@ -214,7 +223,14 @@ def look(base_url: str, model: str, direction: str = "ahead",
             out["bearings"] = "you don't recognize any of this -- somewhere new, so you start a fresh map of it"
         else:
             lost = {**lost, "tries": lost["tries"] + 1}
-    return _save(out, heading, lost)
+    return _save(out, heading, lost, light)
+
+
+def light_change(before: float | None, now: float) -> str | None:
+    """"lights_on"/"lights_off" when the frame is much brighter/darker than the last look the same way."""
+    if before is None or abs(now - before) <= LIGHT_CHANGE:
+        return None
+    return "lights_on" if now > before else "lights_off"
 
 
 def facing_words_for(heading: float) -> str:
@@ -263,19 +279,23 @@ def list_objects(base_url: str, model: str, jpeg: bytes) -> list[str]:
         return []
 
 
-def _save(out: dict[str, Any], heading: float = 0.0, lost: dict | None = None) -> dict[str, Any]:
+def _save(out: dict[str, Any], heading: float = 0.0, lost: dict | None = None,
+          light: float | None = None) -> dict[str, Any]:
     """by_direction: the last scene per named look (the dashboard's Camera tab);
     views: the map -- per room direction (heading + head pan), what the next look
-    that way is compared with; not added to while lost (which way is unknown)."""
+    that way is compared with (view_light: how bright it was); not added to while
+    lost (which way is unknown)."""
     out["ts"] = time.time()
     record = last_look()
     by_direction = {**record.get("by_direction", {}), out["direction"]: out["scene"]}
-    views = record.get("views", {})
+    views, view_light = record.get("views", {}), record.get("view_light", {})
     if not lost:
         pan, tilt = out.get("head", (0, 0))
         views = {**views, view_key(heading + pan, tilt): out["scene"]}
+        if light is not None:
+            view_light = {**view_light, view_key(heading + pan, tilt): round(light, 1)}
     atomic_write(VISION_PATH, json.dumps({**out, "by_direction": by_direction, "views": views,
-                                          "heading": heading, "lost": lost}))
+                                          "view_light": view_light, "heading": heading, "lost": lost}))
     return out
 
 
@@ -311,6 +331,10 @@ def demo() -> None:
             cognition.ask = real_ask
         assert facing_words_for(-40) == "40 degrees to the left of how you faced at first"
         assert head_words(0, 3) == "head pointing straight ahead"
+        assert light_change(None, 120) is None and light_change(100, 120) is None  # first look / same light
+        assert light_change(60, 150) == "lights_on" and light_change(150, 60) == "lights_off"
+        _save({"scene": "a lamp", "changed": False, "what_changed": "", "direction": "ahead", "head": (0, 0)}, light=150.0)
+        assert last_look()["view_light"][view_key(0, 0)] == 150.0
         assert head_words(-45, 0) == "head turned 45 degrees to your left"
         assert head_words(30, 10) == "head turned 30 degrees to your right and 10 degrees up"
         try:

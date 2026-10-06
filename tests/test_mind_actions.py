@@ -136,7 +136,8 @@ if cfg.SOUNDS:
     do("play_sound", {"name": cfg.SOUNDS[0]})
     assert body["dispatch"][-1] == [cfg.SOUNDS[0]]
 do("remember", {"kind": "person", "about": "Anna", "category": "Likes", "text": "likes green tea"})
-assert memory.read_note("person", "Anna") == ["- [likes] likes green tea"]
+note = memory.read_note("person", "Anna")
+assert len(note) == 1 and note[0].startswith("- [likes] likes green tea (") and note[0].endswith(" mind)"), note  # (when, how)
 do("remind_me", {"in_minutes": 5, "about": "check the door"})
 assert [r["about"] for r in state.load_session()["reminders"]] == ["check the door"]
 do("watch", {"for": "sound", "about": "the knock"})

@@ -80,15 +80,22 @@ def imu_events(before: dict | None, now: dict | None) -> list[Event]:
 
 
 MOTION_LEVEL = 12.0  # mean abs pixel change (0-255) on a 32x24 grey frame; a person moving ~20-60, noise ~2-5
+BIG_MOTION = 3.0  # x MOTION_LEVEL: the whole view changing (lights, being carried) -- news even with nobody in it
 
 
-def motion_events(levels: list) -> list[Event]:
+def motion_events(levels: list, objects: list | None = None) -> list[Event]:
     """levels: oldest-first, twice a second. Two high samples in a row -- one
     jump is the head itself turning (a glance), sustained change is something
-    moving in view."""
-    if len(levels) >= 2 and min(levels[-2:]) >= MOTION_LEVEL:
-        return [("motion", f"something is moving in front of you (change {max(levels[-2:]):.0f})")]
-    return []
+    moving in view. `objects`: the detector's fresh boxes (common/objects.py) --
+    with them, motion is news only when a person is in view or the change is
+    very large (275 "something is moving" notices in an empty room, 2026-10-03);
+    None (no fresh boxes: detector off) means any motion counts, as before."""
+    if len(levels) < 2 or min(levels[-2:]) < MOTION_LEVEL:
+        return []
+    if objects is not None and min(levels[-2:]) < BIG_MOTION * MOTION_LEVEL \
+            and not any(o.get("name") == "person" for o in objects):
+        return []
+    return [("motion", f"something is moving in front of you (change {max(levels[-2:]):.0f})")]
 
 
 def latch_events(prev: dict, cur: dict, lifted: bool | None = None) -> list[Event]:
@@ -150,6 +157,10 @@ def demo() -> None:
     assert loudness_events([loud] * 5 + [loud * 1.2]) == []  # already-loud room
     assert motion_events([2, 3, 30, 28])[0][0] == "motion"
     assert motion_events([2, 3, 30, 2]) == [] and motion_events([30]) == []  # one jump: the head turned
+    assert motion_events([2, 3, 30, 28], [{"name": "chair"}]) == []  # nobody there: a flicker, not news
+    assert motion_events([2, 3, 30, 28], [{"name": "chair"}, {"name": "person"}])[0][0] == "motion"
+    assert motion_events([2, 3, 40, 38], [])[0][0] == "motion"  # the whole view changed: lights, carried
+    assert motion_events([2, 3, 30, 28], None)[0][0] == "motion"  # detector off or stale: as before
     assert latch_events({"cliff": False}, {"cliff": True})[0][0] == "picked_up"
     assert latch_events({"cliff": True}, {"cliff": True}) == []
     assert latch_events({}, {"cliff": True}, lifted=False)[0][0] == "edge"           # nobody touched it

@@ -15,7 +15,13 @@ echo "== apt packages"
 sudo apt update
 sudo apt install -y git curl unzip alsa-utils ffmpeg file pipx python3-pip espeak sox \
   python3-requests python3-flask python3-filelock python3-numpy python3-pygame \
-  python3-pydantic python3-pil python3-opencv
+  python3-pydantic python3-pil python3-opencv python3-usb
+
+echo "== a reSpeaker XVF3800 mic array (optional): its direction finder, readable without root"
+echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="2886", ATTRS{idProduct}=="001a", MODE="0664", GROUP="plugdev"' \
+  | sudo tee /etc/udev/rules.d/99-openbot-respeaker.rules >/dev/null
+sudo usermod -aG plugdev "$USER"
+sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=usb
 
 echo "== speech: Vosk + Whisper (hearing), Piper (voice)"
 # --ignore-installed: pip can't uninstall Debian-owned deps (e.g. click) when upgrading them

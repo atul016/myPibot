@@ -55,6 +55,21 @@ def navigate(task: dict, timeout_s: float = 5.0) -> tuple[bool, str]:
         return False, str(e)
 
 
+def look_toward(pan_deg: float, timeout_s: float = 2.0) -> bool:
+    """Glance the head toward a voice (degrees, + right) -- openbot-alive's face tracker holds it
+    there a few seconds, then a face it finds takes over. False if alive didn't answer."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout_s)
+            sock.connect(SOCK_PATH)
+            sock.sendall(json.dumps({"look_toward": float(pan_deg)}).encode() + b"\n")
+            ok = bool(json.loads(sock.recv(4096)).get("ok"))
+        mark_self_noise()  # the head's servos whine too
+        return ok
+    except Exception:
+        return False
+
+
 def cancel_navigation(timeout_s: float = 2.0) -> bool:
     """Stop any drive now. True if one was running."""
     try:

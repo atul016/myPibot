@@ -7,6 +7,9 @@ WeSpeaker's own: Kaldi-style 80-bin log-mel fbank, 25/10 ms Hamming frames on
 """
 from __future__ import annotations
 
+import re
+import time
+
 import numpy as np
 
 from .faces import MODEL_DIR, name_slug
@@ -18,6 +21,11 @@ RATE = 16000
 MATCH = 0.55       # cosine similarity to call it that person's voice -- a calibration knob for this mic and room
 MAX_SAMPLES = 20   # per person, newest kept
 MIN_SECONDS = 1.0  # shorter than this, a voice print is a guess
+NEAR_FACE = 0.12   # the one face's width as a fraction of the frame: closer than this, the voice is theirs
+OBJECTS_FRESH_S = 5.0  # detector boxes older than this don't say how many people are in view
+# "I'm not Atul", "I am not Atul", "I'm Atul's wife": the voice just learned as theirs wasn't.
+NOT_ME = re.compile(r"\b(?i:i'?m not|i am not)\s+([A-Z][a-z]+)\b|\b(?i:i'?m|i am)\s+([A-Z][a-z]+)['’]s\s+"
+                    r"(?i:wife|husband|partner|son|daughter|mother|father|mom|dad|brother|sister|friend)\b")
 
 
 def _mel_banks(bins: int = 80, n_fft: int = 512, low: float = 20.0, high: float = RATE / 2) -> np.ndarray:
@@ -70,6 +78,48 @@ def enroll(name: str, emb: np.ndarray) -> int:
     return len(samples)
 
 
+def can_teach(faces_data: dict, boxes: list[dict], boxes_ts: float) -> str | None:
+    """Whose voice this is for sure -- the one known face in view, when the detector (fresh) also
+    sees exactly one person and the face is near. Two people sitting together taught Rocky his
+    wife's voice as Atul's (2026-10-04). None: don't learn from this."""
+    faces = faces_data.get("faces", [])
+    if len(faces) != 1 or not faces[0].get("name") or time.time() - boxes_ts > OBJECTS_FRESH_S:
+        return None
+    if sum(1 for o in boxes if o.get("name") == "person") != 1:
+        return None
+    if faces[0]["box"][2] < NEAR_FACE * faces_data.get("w", 640):
+        return None
+    return faces[0]["name"].replace("-", " ").title()
+
+
+def speaker(face: str | None, heard: str | None, boxes: list[dict], boxes_ts: float) -> str | None:
+    """Who's talking when this voice isn't one to learn from (can_teach said no): the voice's own match,
+    else the one face in view -- unless more than one person is there: then it needn't be the one talking
+    (his wife got called Atul, 2026-10-04). Alone, near or far, the face says who even before the voice
+    print matches (prints taught on another mic score low)."""
+    crowd = time.time() - boxes_ts < OBJECTS_FRESH_S and sum(o.get("name") == "person" for o in boxes) > 1
+    return heard or (None if crowd else face)
+
+
+def denied_name(text: str) -> str | None:
+    """The known name `text` says this speaker is not -- "No, I'm not Atul" -> "Atul"."""
+    m = NOT_ME.search(text)
+    return (m.group(1) or m.group(2)) if m else None
+
+
+def forget_last(name: str) -> bool:
+    """Drops the newest voice sample taught for `name` (it was someone else's); False if there was none."""
+    path = VOICES_DIR / f"{name_slug(name)}.npy"
+    if not path.exists():
+        return False
+    samples = np.load(path)[:-1]
+    if len(samples):
+        np.save(path, samples)
+    else:
+        path.unlink()
+    return True
+
+
 def identify(emb: np.ndarray) -> tuple[str | None, float]:
     """(the best-matching known voice's name, or None below MATCH; its similarity)."""
     best, score = None, 0.0
@@ -96,6 +146,26 @@ def demo() -> None:
         a, b = np.eye(4)[0], np.eye(4)[1]
         assert enroll("Atul", a) == 1 and identify(a) == ("Atul", 1.0)
         assert identify(b)[0] is None  # a voice nobody taught it
+        enroll("Atul", b)  # the wife's voice, learned as Atul's while they sat together
+        assert identify(b) == ("Atul", 1.0)
+        assert denied_name("No, I'm not Atul. I'm his wife") == "Atul" == denied_name("I am Atul's wife")
+        assert denied_name("I'm not sure") is None and denied_name("I'm Atul") is None
+        assert forget_last("Atul") and identify(b)[0] is None and identify(a) == ("Atul", 1.0)
+        assert forget_last("Atul") and not forget_last("Atul") and identify(a)[0] is None  # none left: file gone
+        one = {"w": 640, "faces": [{"name": "atul", "box": [100, 100, 120, 120]}]}
+        now = time.time()
+        assert can_teach(one, [{"name": "person"}], now) == "Atul"
+        assert can_teach(one, [{"name": "person"}, {"name": "person"}], now) is None  # two people: whose voice?
+        assert can_teach(one, [{"name": "person"}], now - 10) is None  # stale boxes: can't tell how many
+        assert can_teach({"w": 640, "faces": [{"name": "atul", "box": [100, 100, 40, 40]}]}, [{"name": "person"}], now) is None
+        assert can_teach({"w": 640, "faces": [{"name": "atul", "box": [0, 0, 120, 120]}, {"name": None, "box": [1, 1, 99, 99]}]},
+                         [{"name": "person"}], now) is None
+        two = [{"name": "person"}, {"name": "person"}]
+        assert speaker("Atul", None, two, now) is None              # two people, a voice it doesn't know: no guess
+        assert speaker("Atul", "Anna", two, now) == "Anna"          # the voice knows better than the face
+        assert speaker("Atul", None, [{"name": "person"}], now) == "Atul"  # alone (or far): the face says who
+        assert speaker("Atul", None, [], now) == "Atul" and speaker("Atul", None, two, now - 10) == "Atul"  # missed / stale
+        assert speaker(None, None, [], now) is None
     finally:
         VOICES_DIR = orig
         shutil.rmtree(test_dir, ignore_errors=True)

@@ -50,6 +50,7 @@ class Body(Protocol):
     def acquire(self, target: str) -> Sighting | None: ...   # slow, smart (the vision model): find + start tracking
     def track(self, target: str) -> Sighting | None: ...     # fast (a video tracker, ~10Hz): where it is now, or lost
     def person(self) -> Sighting | None: ...                 # follow(): the object detector's newest person, or None
+    def heading(self) -> float | None: ...                   # turn_by(): degrees turned so far, + right (an IMU)
 
 
 # --- tuning (each one exercised by the sim's scenarios) ---------------------------
@@ -324,6 +325,50 @@ def explore(body: Body, max_steps: int = 120, rng: random.Random | None = None) 
         return Outcome(True, "explored", max_steps, sorted(seen))
     except Stop as e:
         return Outcome(False, str(e), 0, sorted(seen))
+
+
+# --- turning to face someone (a voice's direction; needs a heading: the IMU) --------------------
+FACE_DONE_DEG = 12.0      # this close to their direction: facing them
+FACE_MOVE_S = 0.8         # one arc at full lock (~25-30 degrees at SPEED)
+FACE_MAX_MOVES = 16
+FACE_WRONG_WAY_DEG = 8.0  # a move that leaves it this much further off: a wrong sign, or a push -- stop
+FACE_STALLED_MOVES = 3    # moves in a row that turn it under 2 degrees: the wheels aren't turning it (or the IMU stopped)
+
+
+def turn_by(body: Body, degrees: float, max_moves: int = FACE_MAX_MOVES) -> Outcome:
+    """Turns about `degrees` (+ right) where it stands: a three-point turn -- an arc forward
+    at full lock, then back over that ground with the wheels the other way (both turn it the
+    same way) -- each a guarded Driver move, watching its heading rather than counting
+    seconds. Stops facing that way; when there's no room to move; when a move leaves it
+    further off than before (it must never spin round on a wrong sign); or when moves stop
+    turning it (motors off, or a heading that stopped changing -- never drive on blind)."""
+    start = body.heading()
+    if start is None:
+        return Outcome(False, "I can't feel which way I'm turning")
+    target, drv, left, stuck, idle = start + degrees, Driver(body, CLOSE_GUARD_CM), degrees, 0, 0
+    try:
+        for move in range(max_moves):
+            if abs(left) <= FACE_DONE_DEG:
+                return Outcome(True, "facing them now", move)
+            steer = -30.0 if left > 0 else 30.0  # Driver's convention: + steers left
+            if not (move % 2 and drv.back(-steer, FACE_MOVE_S)):
+                result = drv.forward(steer, FACE_MOVE_S, guard_cm=CLOSE_GUARD_CM)
+                stuck = stuck + 1 if result != "ok" and drv.credit < 0.1 else 0
+                if stuck >= 2:
+                    return Outcome(False, "there's no room to turn here", move + 1)
+            now_left = target - body.heading()
+            if abs(now_left) > abs(left) + FACE_WRONG_WAY_DEG:
+                return Outcome(False, "I was turning the wrong way, so I stopped", move + 1)
+            idle = idle + 1 if abs(now_left - left) < 2.0 else 0
+            if idle >= FACE_STALLED_MOVES:
+                return Outcome(False, "my wheels aren't turning me", move + 1)
+            left = now_left
+    except Stop as e:
+        return Outcome(False, str(e))
+    finally:
+        body.stop()
+    return Outcome(abs(left) <= 2 * FACE_DONE_DEG, "facing them now" if abs(left) <= 2 * FACE_DONE_DEG
+                   else f"I turned, but I'm still about {abs(left):.0f} degrees off", max_moves)
 
 
 # --- following a person ("follow me") ----------------------------------------------------

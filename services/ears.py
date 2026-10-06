@@ -9,6 +9,9 @@ and serves, on 127.0.0.1 only (this is the house's live audio):
               loudness and what it sounded like -- YAMNet's best guess
               (common/sounds.py), None if unsure, OWN_VOICE while Rocky was
               making sound. openbot-mind asks this (common/hearing.read).
+              With a reSpeaker XVF3800 (and OPENBOT_DOA_FRONT): "voices",
+              [time, bearing] ten times a second while someone speaks --
+              which way, in degrees from Rocky's front, + right (Doa below).
 
 Before this, wake-listen owned the mic and wrote loudness to a file only while
 idle -- for as long as a conversation stayed open the mind got nothing and
@@ -19,12 +22,16 @@ HTTP -> curl -> wake-listen's buffer: 2.7ms median, 6ms worst, per 46ms chunk
 from __future__ import annotations
 
 import json
+import math
 import queue
+import struct
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable
 
-from common import health, mic_stream, sounds, speak_client
+from common import health, hearing, mic_stream, sounds, speak_client
 from common.hearing import CHUNK_FRAMES, EARS_PORT, HISTORY_S, MIC_DEVICE, OWN_VOICE, rms
 from common.stt import MIC_RATE, VOSK_RATE, resample_pcm
 
@@ -106,14 +113,80 @@ class Meter:
             return {"levels": list(self.levels), "sounds": list(self.names), "ts": self.ts}
 
 
-def make_handler(ring: Ring, meter: Meter) -> type[BaseHTTPRequestHandler]:
+ARRAY_USB = (0x2886, 0x001A)     # reSpeaker XVF3800 (udev: /etc/udev/rules.d/99-openbot-respeaker.rules)
+SELECTED_AZIMUTHS = (35, 11, 8)  # resid, cmdid, bytes: [the processed speaker direction, the auto-select beam]
+
+
+def array_reader() -> Callable[[], float | None]:
+    """The XVF3800's processed speaker direction (AUDIO_MGR_SELECTED_AZIMUTHS[0]: it picks,
+    by speech energy, among its focused beams), in the array's own degrees -- None while
+    nobody speaks (NaN). Not DOA_VALUE: that one stays on one focused beam (read 346 for 90 s
+    wherever someone talked, 2026-10-04)."""
+    import usb.core  # deferred: python3-usb is only needed with the array
+    import usb.util
+    dev = usb.core.find(idVendor=ARRAY_USB[0], idProduct=ARRAY_USB[1])
+    if dev is None:
+        raise OSError("no reSpeaker XVF3800 on USB")
+    req = usb.util.CTRL_IN | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE
+    resid, cmdid, n = SELECTED_AZIMUTHS
+
+    def read() -> float | None:
+        for _ in range(10):
+            r = dev.ctrl_transfer(req, 0, 0x80 | cmdid, resid, n + 1, 200).tobytes()
+            if r[0] == 0:  # status: 0 ok, 64 busy -- ask again
+                v = struct.unpack("<f", r[1:5])[0]
+                return None if math.isnan(v) else math.degrees(v) % 360
+            time.sleep(0.005)
+        return None
+    return read
+
+
+class Doa:
+    """Which way a voice comes from, 10 times a second, as (time, bearing): degrees from
+    Rocky's front, + right (hearing.bearing). Not while Rocky makes sound himself: no echo
+    cancelling yet, so his own voice would point at his speaker. Off without the array or
+    python3-usb; keeps trying (it may be plugged in later); the audio loop never waits on it."""
+
+    def __init__(self, front: float, ccw: bool = False, read: Callable[[], float | None] | None = None,
+                 playing: Callable[[], bool] = speak_client.playing) -> None:
+        self.front, self.ccw, self.playing, self._read = front, ccw, playing, read
+        self.samples: deque = deque(maxlen=HISTORY_S * 10)
+        self.lock = threading.Lock()
+
+    def add(self, raw: float | None, now: float) -> None:
+        if raw is None or self.playing():
+            return
+        with self.lock:
+            self.samples.append((round(now, 2), round(hearing.bearing(raw, self.front, self.ccw))))
+
+    def recent(self) -> list[list[float]]:
+        with self.lock:
+            return [list(s) for s in self.samples]
+
+    def run(self) -> None:
+        failures = 0
+        while True:
+            try:
+                read = self._read or array_reader()
+                while True:
+                    self.add(read(), time.time())
+                    failures = 0
+                    time.sleep(0.1)
+            except Exception as e:
+                failures += 1
+                if failures in (1, 10) or failures % 100 == 0:
+                    print(f"{COMPONENT}: voice direction off for now ({e!r})")
+                time.sleep(min(30.0, 2.0 * failures))
+
+
+def make_handler(ring: Ring, meter: Meter, doa: Doa | None = None) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args) -> None:  # quiet: the mind asks every few seconds
             pass
 
         def do_GET(self) -> None:
             if self.path == "/hearing":
-                body = json.dumps(meter.snapshot()).encode()
+                body = json.dumps({**meter.snapshot(), "voices": doa.recent() if doa else []}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -146,8 +219,12 @@ def main() -> None:
     except Exception as e:  # optional, like the camera's detectors: no model, no names
         print(f"{COMPONENT}: sound names off ({e})")
         classifier = None
-    ring, meter = Ring(), Meter(classifier)
-    server = ThreadingHTTPServer(("127.0.0.1", EARS_PORT), make_handler(ring, meter))
+    ring, meter, doa = Ring(), Meter(classifier), None
+    if hearing.DOA_FRONT is not None:
+        doa = Doa(float(hearing.DOA_FRONT), hearing.DOA_CCW)
+        threading.Thread(target=doa.run, daemon=True).start()
+        print(f"{COMPONENT}: voice direction on (front = {hearing.DOA_FRONT} deg on the array)")
+    server = ThreadingHTTPServer(("127.0.0.1", EARS_PORT), make_handler(ring, meter, doa))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"{COMPONENT}: listening to the mic, serving 127.0.0.1:{EARS_PORT} (/pcm, /hearing)")
@@ -195,13 +272,32 @@ def demo() -> None:
     snap = meter.snapshot()
     assert snap["levels"] == [0, 10000, 10000] and snap["sounds"] == ["Knock", "Knock", OWN_VOICE], snap
 
+    # Doa: bearings from Rocky's front while someone speaks -- not his own voice, not silence
+    doa = Doa(178.0, playing=lambda: speaking[0])
+    speaking[0] = False
+    doa.add(269.0, 10.0)            # his right
+    doa.add(None, 10.1)             # nobody speaking (the array says NaN)
+    speaking[0] = True
+    doa.add(170.0, 10.2)            # his own voice, toward his speaker
+    speaking[0] = False
+    doa.add(178.0, 10.3)            # straight ahead
+    assert doa.recent() == [[10.0, 91], [10.3, 0]], doa.recent()
+    reads = iter([89.0, None])      # his left
+    feed = Doa(178.0, read=lambda: next(reads), playing=lambda: False)
+    threading.Thread(target=feed.run, daemon=True).start()  # then the reads run out (raises): it backs off, no crash
+    deadline = time.time() + 2
+    while not feed.recent() and time.time() < deadline:
+        time.sleep(0.01)
+    assert [b for _, b in feed.recent()] == [-89], feed.recent()
+
     # HTTP: /hearing's shape, and two /pcm clients receiving identical, chunk-aligned audio
     ring = Ring()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(ring, meter))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(ring, meter, doa))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_address[1]}"
-    assert json.loads(urllib.request.urlopen(f"{url}/hearing", timeout=2).read())["sounds"][-1] == OWN_VOICE
+    got = json.loads(urllib.request.urlopen(f"{url}/hearing", timeout=2).read())
+    assert got["sounds"][-1] == OWN_VOICE and got["voices"] == [[10.0, 91], [10.3, 0]], got
     clients = [urllib.request.urlopen(f"{url}/pcm", timeout=2) for _ in range(2)]
     time.sleep(0.2)  # both connected before the audio starts
     for i in range(5):
@@ -212,6 +308,17 @@ def demo() -> None:
     print("ears: ok")
 
 
+def show_doa() -> None:
+    """`python3 -m services.ears --doa`: the array's raw angle while someone speaks -- talk from
+    straight in front of the robot and that number is OPENBOT_DOA_FRONT; talk from its right
+    and it should go up (clockwise: an XVF3800 with its LEDs up; if it goes down: OPENBOT_DOA_CCW=1)."""
+    read = array_reader()
+    while True:
+        raw = read()
+        print(f"{raw:5.0f}" if raw is not None else "    -", flush=True)
+        time.sleep(0.25)
+
+
 if __name__ == "__main__":
     import sys
-    demo() if "--check" in sys.argv else main()
+    demo() if "--check" in sys.argv else show_doa() if "--doa" in sys.argv else main()

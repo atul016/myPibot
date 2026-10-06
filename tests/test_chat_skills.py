@@ -34,7 +34,7 @@ REFUSAL = re.compile(r"\b(can't|cannot|can not|no can|not able|unable|won't|need
                      r"in person|be here|not here|stuck|out loud)\b", re.I)
 no_claim = lambda reply: not CLAIM.search(reply) or bool(REFUSAL.search(reply))  # noqa: E731
 
-VOICE_ONLY = {"move", "drive_to", "look", "explore", "follow_me", "stop"}
+VOICE_ONLY = {"move", "drive_to", "look", "explore", "follow_me", "stop", "face_me"}
 CASES = [  # (their text, session, the skills it must do -- "refused": must name one it can't by text, a check, history)
     ("Stop texting me for 1 hour", {}, {"pause_texting"}, lambda a: a[0].minutes == 60, []),
     ("send me a pic", {}, {"send_photo"}, None, []),
@@ -48,6 +48,7 @@ CASES = [  # (their text, session, the skills it must do -- "refused": must name
     ("/be-quite", {"in_session": True}, {"end_conversation"}, None, []),     # how "quiet" often gets typed
     ("drive forward", {}, "refused", None, []),          # needs someone there: says so, does nothing
     ("look left", {}, "refused", None, []),
+    ("turn towards me", {}, "refused", None, []),         # no voice to point at, by text
     ("Remember that Anna's birthday is in May", {}, {"remember"}, lambda a: a[0].kind == "person", []),
     ("remind me in 20 minutes to check the oven", {}, {"remind"}, lambda a: a[0].at == "in 20 minutes", []),
     ("add milk to my shopping list", {}, {"add_task"}, None, []),
@@ -63,6 +64,8 @@ CASES = [  # (their text, session, the skills it must do -- "refused": must name
       {"role": "assistant", "content": json.dumps({"tone_action": "none", "reply": "Here you go!"})}]),
     ("I'm too quiet today", {}, set(), None, []),        # words that used to be commands
     ("I remember my first bike", {}, set(), None, []),
+    ("forget about Anna, delete what you know about her", {}, {"forget"}, lambda a: a[0].what.lower() == "anna", []),
+    ("never mind, forget it", {}, set(), None, []),       # drop the subject, not an erase
     ("how are you?", {}, set(), None, []),
     ("It was always der", {}, set(), None,               # an answer to its own text -- read in context
      [{"role": "user", "content": "(nobody texted -- you texted them first)"},

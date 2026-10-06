@@ -81,7 +81,7 @@ PHRASE_MAP = [
     (r"it appears that", "maybe"),
     (r"i think that", "I think"),
     (r"i believe that", "I think"),
-    (r"you know what", ""),
+    (r"\byou know what\s*[,?!.:]\s*", ""),  # the filler ("You know what? ..."), not "do you know what's going on?"
     (r"to be honest", ""),
     (r"basically", ""),
     (r"actually", ""),
@@ -114,6 +114,8 @@ def rocky_transform(text: str) -> str:
 
         for pattern, replacement in _PHRASE_PATTERNS:
             s = pattern.sub(replacement, s)
+        if not s.strip(" ,.!?:"):
+            continue  # the sentence was only a filler ("You know what?") -- not ", question?"
 
         words = s.split()
         new_words = []
@@ -163,6 +165,8 @@ def demo() -> None:
     assert rocky_transform("What is your name?").endswith("question?")
     assert "we bump fist" in rocky_transform("Let's fist bump")
     assert rocky_transform("No, I'm not scared scared scared.") == "No, I not scared scared scared."  # not x9
+    assert rocky_transform("Do you know what's going on with the sensors?").startswith("Do you know what going on")
+    assert rocky_transform("You know what? I like it.") == "I like it."  # a filler, dropped
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ import movement.bus  # one lock around all I2C traffic (threads were corrupting 
 
 import config as cfg  # noqa: E402
 from common import events as dash_events  # noqa: E402
-from common import faces, health, imu, journal, persona as persona_mod, policy, react, sensors, state, surprise  # noqa: E402
+from common import faces, health, imu, journal, objects, persona as persona_mod, policy, react, sensors, state, surprise  # noqa: E402
 from common.bounded import run_bounded  # noqa: E402
 from common.motor_client import SOCK_PATH  # noqa: E402
 from common import speak_client as speak_client_mod  # noqa: E402
@@ -98,12 +98,15 @@ def _battery_percent(voltage: float) -> float | None:
 # own guarding -- floor + ultrasonic every 50ms). "Stop" sets NAV_CANCEL.
 NAVIGATING = threading.Event()
 NAV_CANCEL = threading.Event()
+NAV_KIND = ["drive"]  # published as sensors' "driving": "turn" is in place -- the mind keeps its bearings
 
 
 def _start_navigation(car, monitor, task: dict, action_flow) -> str:
     if NAVIGATING.is_set():
         return "already driving"
     NAV_CANCEL.clear()
+    NAV_KIND[0] = "turn" if task.get("turn") is not None else "drive"  # before NAVIGATING: the face tracker reads it
+    GLANCE["until"] = 0.0  # the body is about to move: a glance from before would point the wrong way after
     NAVIGATING.set()
     threading.Thread(target=_navigate, args=(car, monitor, task, action_flow), daemon=True).start()
     return ""
@@ -113,16 +116,17 @@ def _navigate(car, monitor, task: dict, action_flow) -> None:
     from movement import navigate
     from movement.real_body import RealBody
 
-    body = RealBody(car, monitor, cfg, NAV_CANCEL)
-    target, following = task.get("approach"), bool(task.get("follow"))
+    body = RealBody(car, monitor, cfg, NAV_CANCEL, heading=lambda: (IMU_NOW[0] or {}).get("heading"))
+    target, following, turn = task.get("approach"), bool(task.get("follow")), task.get("turn")
     dash_events.log_event("safety", "driving: following a person" if following
+                          else f"driving: turning {float(turn):+.0f} degrees to face someone" if turn is not None
                           else f"driving: {'to the ' + target if target else 'exploring'}")
     try:
         if following:
             body.tilt = navigate.FOLLOW_TILT  # head up at the person, not down at the floor
         body.look(0)  # driving pose (head down at the floor ahead) -- wherever the face tracker left it
-        outcome = (navigate.follow(body) if following else navigate.approach(body, target) if target
-                   else navigate.explore(body, int(task.get("explore", 60))))
+        outcome = (navigate.follow(body) if following else navigate.turn_by(body, float(turn)) if turn is not None
+                   else navigate.approach(body, target) if target else navigate.explore(body, int(task.get("explore", 60))))
     except Exception as e:  # never leave the motors running on a bug
         outcome = navigate.Outcome(False, f"something went wrong ({e})")
     finally:
@@ -131,13 +135,18 @@ def _navigate(car, monitor, task: dict, action_flow) -> None:
         body.look(0)
         NAVIGATING.clear()
     what = (f"followed someone: {outcome.reason}" if following
+            else f"turned to face someone: {outcome.reason}" if turn is not None
             else f"drove {'to the ' + target if target else 'around exploring'}: {outcome.reason}")
     dash_events.log_event("safety", f"driving done: {outcome.reason} ({outcome.steps} steps)")
     print(f"drive: done -- {outcome.reason} ({outcome.steps} rounds)")
+    if task.get("quiet"):
+        return  # turned to face someone mid-conversation (wake-listen, the face tracker): the talk goes on
     journal.log("did", what)
     # How it went is the LLM's to tell (in its mood); the facts come from the drive.
     situation = (f"You just stopped driving because they said stop." if outcome.reason == "cancelled"
                  else f"You were following them, and you've stopped: {outcome.reason}." if following
+                 else "You've turned round to face them." if turn is not None and outcome.done
+                 else f"You tried to turn to face them, and stopped: {outcome.reason}." if turn is not None
                  else f"You just made it to the {target}!" if target and outcome.done
                  else f"Your drive ended: {outcome.reason}." + (f" Along the way you saw: {', '.join(outcome.seen)}."
                                                               if outcome.seen else ""))
@@ -167,6 +176,11 @@ def _action_server(action_flow: ActionFlow, car, monitor) -> None:
         try:
             raw = conn.recv(65536)
             req = json.loads(raw.decode())
+            if req.get("look_toward") is not None:
+                pan = max(-faces.PAN_LIMIT, min(faces.PAN_LIMIT, float(req["look_toward"])))  # past it: the limit
+                GLANCE.update(pan=pan, until=time.time() + GLANCE_HOLD_S)
+                conn.sendall(json.dumps({"ok": True}).encode())
+                continue
             if req.get("navigate_cancel"):
                 NAV_CANCEL.set()
                 conn.sendall(json.dumps({"ok": True, "was_driving": NAVIGATING.is_set()}).encode())
@@ -210,7 +224,7 @@ def main() -> None:
     monitor.start_distance_watchdog()
 
     threading.Thread(target=_action_server, args=(action_flow, car, monitor), daemon=True).start()
-    threading.Thread(target=_face_tracker, args=(car, action_flow), daemon=True).start()
+    threading.Thread(target=_face_tracker, args=(car, action_flow, monitor), daemon=True).start()
     threading.Thread(target=_imu_loop, args=(action_flow,), daemon=True).start()
 
     health.record_success(COMPONENT)
@@ -242,6 +256,8 @@ def main() -> None:
             if time.time() >= next_sleep_check:
                 asleep = bool(state.load_session().get("asleep"))
                 monitor.paused = asleep
+                if asleep and NAVIGATING.is_set():
+                    NAV_CANCEL.set()  # asleep, the ultrasonic stops: no drive goes on blind
                 next_sleep_check = time.time() + 1.0
             if asleep:
                 # "Go to sleep": no sensors, no cliff/proximity reflexes, no fidgets -- only the
@@ -253,8 +269,8 @@ def main() -> None:
             if NAVIGATING.is_set():
                 # The drive guards itself; reflexes (a bullfight push!) and fidgets would fight it.
                 if time.time() >= next_sensor_publish:
-                    sensors.publish(**monitor.snapshot(), battery_v=battery_v, battery_pct=battery_pct, driving=True,
-                                    head=dict(HEAD), imu=IMU_NOW[0])
+                    sensors.publish(**monitor.snapshot(), battery_v=battery_v, battery_pct=battery_pct,
+                                    driving=NAV_KIND[0], head=dict(HEAD), imu=IMU_NOW[0])
                     next_sensor_publish = time.time() + 1.0
                 health.record_success(COMPONENT, min_interval_s=5.0)
                 time.sleep(0.05)
@@ -321,40 +337,71 @@ def _imu_loop(action_flow: ActionFlow) -> None:
 # is published at once: the camera's motion reading would otherwise beat the next 1s publish.
 HEAD = {"pan": 0.0, "tilt": 0.0, "moved_ts": 0.0}
 HEAD_MOVED = threading.Event()
+# A voice to look toward (motor_client.look_toward -- the reSpeaker's direction finder): the face
+# tracker holds the head there this long, slightly up where faces are, until it finds a face.
+GLANCE = {"pan": 0.0, "until": 0.0}
+GLANCE_HOLD_S = 4.0
+GLANCE_TILT = 15.0
 
 TRACK_INTERVAL_S = 0.2   # matches openbot-camera's face-check rate
 FACE_LOST_HOLD_S = 3.0   # keep looking where you were this long before drifting back to centre
 WANDER_DEG = (8.0, 5.0)  # idle gaze: small random glances around centre (pan, tilt) -- not a frozen stare
 WANDER_EVERY_S = (3.0, 8.0)
 EASE_DEG = faces.MAX_STEP_DEG  # per tick, toward wherever the head is heading -- same pace as following a face
+# In a conversation: the head this far round to someone for FOLLOW_HOLD_S -> the whole body turns to them.
+FOLLOW_PAN_DEG = 35.0
+FOLLOW_HOLD_S = 1.5
+FOLLOW_GAP_S = 8.0        # at most one such turn this often
+PERSON_FRESH_S = 3.0      # a person box this recent still says where they are (detections come every 2 s)
+PERSON_AFTER_MOVE_S = 0.15  # a box published sooner than this after the head moved was seen from the old view
 
 
 def _ease(cur: float, target: float) -> float:
     return cur + max(-EASE_DEG, min(EASE_DEG, target - cur))
 
 
-def _face_tracker(car: Picarx, action_flow: ActionFlow) -> None:
+def _person_seen(now: float) -> tuple[float, list] | None:
+    """(when, box) of the biggest person the object detector saw since the head last moved -- None if none.
+    ponytail: at the detector's usual pace (every 2 s); objects.want_fast() if following them lags."""
+    found, ts = objects.latest()
+    if now - ts > PERSON_FRESH_S or ts < HEAD["moved_ts"] + PERSON_AFTER_MOVE_S:
+        return None
+    boxes = [o["box"] for o in found if o["name"] == "person"]
+    return (ts, max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))) if boxes else None
+
+
+def _face_tracker(car: Picarx, action_flow: ActionFlow, monitor) -> None:
     """Turns the head toward the biggest face openbot-camera sees -- the
     single most "alive" thing a robot can do. Only between gestures (a
     gesture owns the head; every preset starts with car.reset() and ends
     centred) and never while asleep. After a gesture the
     gaze goes back to the person, not to centre; with nobody around the
-    head glances about a little instead of staring straight ahead."""
+    head glances about a little instead of staring straight ahead.
+    In a conversation it keeps them in view: a person the object detector sees but no face
+    (from the floor a standing adult's face is often above the frame) -> the head tips up
+    toward them; out of view -> it keeps looking where they were; far round to the side
+    (FOLLOW_*) -> the whole body turns to them, and the head comes back to the middle."""
     pan = tilt = 0.0            # where the head is (by our own writes)
     target = (0.0, 0.0)         # where it's heading when no face steers it
-    last_seen = allowed_checked = next_wander = 0.0
-    allowed, talking = False, False
+    last_seen = allowed_checked = next_wander = far_since = last_follow = person_ts = 0.0
+    allowed, talking, busy = False, False, False
     while True:
         time.sleep(TRACK_INTERVAL_S)
         now = time.time()
         if action_flow.status != ActionStatus.STANDBY or NAVIGATING.is_set():
-            # The gesture (or drive) finishes with the head centred. Remember where the
-            # person was, so the gaze returns to them as soon as the head is free.
-            if pan or tilt:
-                target = (pan, tilt) if now - last_seen < FACE_LOST_HOLD_S else (0.0, 0.0)
-            pan = tilt = 0.0
+            if not busy:
+                # The gesture (or drive) finishes with the head centred. Remember where the person was,
+                # so the gaze returns to them as soon as the head is free -- after a turn to face them,
+                # straight ahead (the body moved, not they), a little up where faces are.
+                recent = now - last_seen < FACE_LOST_HOLD_S
+                target = ((0.0, tilt if recent else GLANCE_TILT) if NAVIGATING.is_set() and NAV_KIND[0] == "turn"
+                          else (pan, tilt) if recent else (0.0, 0.0))
+            busy, pan, tilt, far_since = True, 0.0, 0.0, 0.0
             HEAD.update(pan=0.0, tilt=0.0, moved_ts=now)  # the gesture or drive is moving the head
+            if GLANCE["until"] > now:  # a gesture cut a glance short (his reply's nod): look back after it
+                GLANCE["until"] = now + GLANCE_HOLD_S
             continue
+        busy = False
         if now - allowed_checked > 5.0:  # policy reads the session file -- not at 5Hz
             allowed = policy.evaluate("presence").allowed
             talking = state.conversation_active()
@@ -363,17 +410,35 @@ def _face_tracker(car: Picarx, action_flow: ActionFlow) -> None:
             continue
         data = faces.read()
         seen = data.get("faces") or []
+        person = _person_seen(now) if talking and not seen else None
         if seen:
             last_seen = now
             nxt = faces.head_step(seen[0]["box"], (data["w"], data["h"]), pan, tilt)
             if nxt:
                 target = nxt
-        elif now - last_seen > FACE_LOST_HOLD_S:
+        elif person and person[0] != person_ts:  # someone there, but no face: look up where theirs should be
+            person_ts, last_seen = person[0], now
+            target = faces.person_target(person[1], pan, tilt)
+        elif now < GLANCE["until"]:
+            target = (GLANCE["pan"], GLANCE_TILT)  # someone spoke from over there: look until a face turns up
+        # In a conversation it keeps looking where they were, and never wanders: servo noise mid-recording
+        # reads as garbage.
+        elif now - last_seen > FACE_LOST_HOLD_S and not talking:
             if target != (0.0, 0.0) and now - last_seen < 2 * FACE_LOST_HOLD_S:
                 target = (0.0, 0.0)  # they left: drift back to centre first
-            elif now >= next_wander and not talking:  # servo noise mid-recording reads as garbage
+            elif now >= next_wander:
                 target = (random.uniform(-WANDER_DEG[0], WANDER_DEG[0]), random.uniform(-WANDER_DEG[1], WANDER_DEG[1]))
                 next_wander = now + random.uniform(*WANDER_EVERY_S)
+        if talking and now - last_seen < PERSON_FRESH_S and abs(pan) >= FOLLOW_PAN_DEG:
+            far_since = far_since or now
+            if (now - far_since >= FOLLOW_HOLD_S and now - last_follow >= FOLLOW_GAP_S and cfg.CAN_DRIVE
+                    and policy.evaluate("motion").allowed):
+                last_follow, far_since = now, 0.0
+                if not _start_navigation(car, monitor, {"turn": pan, "quiet": True}, action_flow):
+                    print(f"face tracker: they're {pan:+.0f} degrees round -- turning the body to them")
+                    continue  # the head is the drive's now; it looks straight ahead when that's done
+        else:
+            far_since = 0.0
         nxt = (_ease(pan, target[0]), _ease(tilt, target[1]))
         if nxt != (pan, tilt):
             pan, tilt = nxt
@@ -385,7 +450,6 @@ def _face_tracker(car: Picarx, action_flow: ActionFlow) -> None:
                 car.set_cam_tilt_angle(tilt)
             except Exception as e:
                 print(f"face tracker: servo write failed: {e}")
-
 
 if __name__ == "__main__":
     main()

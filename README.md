@@ -47,6 +47,7 @@ The dashboard is at `http://<robot-ip>:8080`; logs: `journalctl -u openbot-wake-
 | `OPENBOT_PERSONA` | which `personas/<name>/` to be |
 | `OPENBOT_LLM_BASE_URL`, `OPENBOT_LLM_MODEL` | the brain |
 | `OPENBOT_STT_DEVICE` | part of your mic's name in `arecord -l` (openbot-ears opens it) |
+| `OPENBOT_DOA_FRONT` | with a reSpeaker XVF3800: the array's angle that points at the robot's front -- talk from straight in front while `python3 -m services.ears --doa` runs (unset: no voice direction); from its right the number should go up, else set `OPENBOT_DOA_CCW=1` |
 | `OPENBOT_IMU_AXES` | with a DFRobot 6 DOF IMU on I2C (0x4A): its axes that point forward, right and down, as mounted (default `+x,+y,+z`: flat, X arrow forward) -- lift the front an inch and see which one moves |
 | `OPENBOT_LOUD_FLOOR` | how loud a sudden sound must be (default 1500, for a USB dongle; a reSpeaker XVF3800 needs ~5000 -- talk and clap, then read `127.0.0.1:9001/hearing`) |
 | `OPENBOT_MIXER` | `card:control` for "louder"/"softer" (`amixer -c 0 scontrols`) |
@@ -423,6 +424,33 @@ cliff reflex aren't "someone": the action queue says when the body is moving its
 taken about the vertical (gyro projected on gravity), so holding it at an angle doesn't skew the count,
 and the gyro's bias is learned only while it's still. No IMU: everything works as before.
 
+## Which way a voice comes from (reSpeaker XVF3800, optional)
+
+The XVF3800 array works out which direction a speaker is in (its processed DoA: it picks, by speech
+energy, among its focused beams -- `DOA_VALUE` sticks to one beam). `openbot-ears` reads it ten times a
+second while someone speaks -- not while the robot talks, which the array would hear as a voice from its
+own speaker -- and serves it as degrees from the robot's front (`/hearing`, `"voices"`). Then:
+
+- **it turns to whoever talks to it** -- the wake word, or anything said in a conversation, read for the
+  time they were actually talking (not the seconds of thinking after): more than 30 degrees round, the
+  whole body turns where it stands, quietly (the conversation does the talking); less, just the head.
+  Not when a skill that drives or moves the head was chosen (it does its own moving), nor when the one in
+  view is the one talking, nor asleep or with motion switched off, nor when the body turned while they
+  talked (that direction was heard from somewhere else);
+- **in a conversation it keeps them in view** (`openbot-alive`'s face tracker): a face -- or, with none, a
+  person the object detector sees (from the floor a standing adult's face is often above the frame), the
+  head tipping up toward where it should be; out of view, it keeps looking where they were; more than 35
+  degrees round for 1.5 s, the whole body turns to them;
+- **"turn towards me"** (skill `face_me`, out loud only: a text has no voice to point at) does it on request.
+
+Every turn is a three-point turn where it stands (`navigate.turn_by`) watching the IMU's heading, each
+move guarded like any drive; it stops if a move takes it further off (a wrong sign never spins it round)
+or if moves stop turning it (motors off, an IMU that stopped). Proven in the simulator first (`turn_*`
+scenarios: 25/25, 5-8 cm from where it stood).
+
+Setup (`setup.sh` does it): `python3-usb`, and a udev rule so the services can read the array without
+root (`/etc/udev/rules.d/99-openbot-respeaker.rules`, group `plugdev`). Then set `OPENBOT_DOA_FRONT`.
+
 ## Tasks and reminders
 
 Ask by text or out loud, in your own words: "add milk to my list", "what's on my list?", "I bought the
@@ -524,6 +552,7 @@ python3 -m personas.rocky.transform
 python3 -m personas.rocky.voice   # needs SDL_AUDIODRIVER=dummy off-Pi
 python3 -m services.chat --check  # who WhatsApp messages are answered from (needs neonize)
 python3 -m services.tasks --check # a spoken reminder is said once, the others left to theirs
+python3 -m services.ears --check  # the mic's ring, loudness, names and voice directions (no mic needed)
 ```
 
 With `OPENBOT_BODY=none` every service except `alive` imports anywhere the

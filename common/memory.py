@@ -22,7 +22,7 @@ from pathlib import Path
 
 import requests
 
-from .state import STATE_DIR
+from .state import STATE_DIR, atomic_write
 
 MIND_DIR = STATE_DIR / "mind"
 # The Basic Memory project (created by setup.sh) -- also the permalink prefix.
@@ -62,15 +62,86 @@ def ensure_note(folder: str, name: str, title: str, note_type: str, body: str = 
     return path
 
 
-def remember(kind: str, about: str, category: str, text: str) -> Path:
-    """Appends `- [category] text` to the note for `about` in `kind`'s folder."""
+def remember(kind: str, about: str, category: str, text: str, source: str = "") -> Path:
+    """Appends `- [category] text` to the note for `about` in `kind`'s folder.
+    `source`: when/where it was learned, as a trailing `(source)` -- Basic Memory's
+    context slot, so it stays in the file but not in what recall() returns
+    (confirmed live). Opt-in: reaction lines are parsed by their exact shape."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {sorted(KINDS)}")
     about = one_line(about, 60) or "general"
     path = ensure_note(KINDS[kind], about, about, kind)
+    source = re.sub(r"[()]", "", one_line(source, 80))
     with path.open("a", encoding="utf-8") as f:
-        f.write(f"- [{slug(category)[:20] or 'note'}] {one_line(text)}\n")
+        f.write(f"- [{slug(category)[:20] or 'note'}] {one_line(text)}" + (f" ({source})" if source else "") + "\n")
     return path
+
+
+def _gist(line: str) -> str:
+    """A note line's fact alone, for comparing: no `- [category] `, no trailing `(source)`, any case."""
+    return re.sub(r"\s*\([^()]*\)\s*$", "", line.split("] ", 1)[-1]).strip().lower()
+
+
+def drop_line(kind: str, about: str, old: str) -> bool:
+    """Removes the ONE line of `about`'s note that says `old` (quoted with or without its
+    category and source) -- so a changed fact replaces the stale one instead of piling up
+    beside it. Same fact first, else the one line containing it; ambiguous or absent: nothing."""
+    path = MIND_DIR / KINDS.get(kind, "-") / f"{slug(about)}.md"
+    want = _gist(old)
+    if not want or not path.exists():
+        return False
+    head, body = path.read_text(encoding="utf-8").split("---\n", 2)[1:]
+    lines = body.splitlines(keepends=True)
+    hits = [i for i, ln in enumerate(lines) if ln.startswith("- ") and _gist(ln) == want] or \
+           [i for i, ln in enumerate(lines) if ln.startswith("- ") and len(want.split()) >= 3 and want in _gist(ln)]
+    if len(hits) != 1:
+        return False
+    atomic_write(path, f"---\n{head}---\n" + "".join(lines[:hits[0]] + lines[hits[0] + 1:]))
+    return True
+
+
+# Too vague to forget by: "forget it" is "never mind", not an erase.
+VAGUE = {"it", "that", "this", "these", "those", "everything", "anything", "something", "all", "me", "you",
+         "yourself", "him", "her", "them", "us", "about", "what", "the", "and"}
+LEADING = {"the", "my", "a", "an", "about", "her", "his", "their", "our", "your"}  # "my doctor visit" -> "doctor visit"
+
+
+def forget_term(what: str) -> str | None:
+    """What forget() matches on: "my doctor visit" -> "doctor visit"; None if too vague."""
+    words = one_line(what, 100).strip(" .,!?\"'").split()
+    while len(words) > 1 and words[0].lower() in LEADING:
+        words.pop(0)
+    term = " ".join(words)
+    return None if len(term) < 3 or term.lower() in VAGUE else term
+
+
+def forget(what: str) -> int | None:
+    """Erases `what` from everything under MIND_DIR: the whole people/places/lessons/self note
+    named after it, and every line mentioning it (whole word, any case) in every other note --
+    dreams, summaries and journal days included. Frontmatter is never touched (Basic Memory
+    rewrites a note missing it). The index drops what's gone within seconds (confirmed live).
+    Returns how many lines went, or None if `what` is too vague to act on. The caller holds
+    the journal lock: other processes append to today's journal."""
+    what = forget_term(what)
+    if what is None:
+        return None
+    mentions = re.compile(rf"(?<!\w){re.escape(what)}(?!\w)", re.IGNORECASE)
+    removed = 0
+    for path in sorted(MIND_DIR.rglob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        if path.parent.name in KINDS.values() and path.stem == slug(what):
+            removed += max(1, sum(ln.startswith("- ") for ln in text.splitlines()))
+            path.unlink()
+            continue
+        parts = text.split("---\n", 2)
+        if len(parts) < 3:
+            continue  # no frontmatter: not one of ours
+        lines = parts[2].splitlines(keepends=True)
+        kept = [ln for ln in lines if not mentions.search(ln)]
+        if len(kept) < len(lines):
+            removed += len(lines) - len(kept)
+            atomic_write(path, f"---\n{parts[1]}---\n" + "".join(kept))
+    return removed
 
 
 def write_note(kind: str, about: str, lines: list[str], category: str = "note") -> Path:
@@ -195,6 +266,33 @@ def demo() -> None:
         assert (MIND_DIR / "self" / "what-works.md").read_text().count("permalink") == 1
         assert read_note("self", "nothing here") == []
         assert recall("") == [] and recall("anything") is None  # server unreachable -> None, never raises
+
+        # provenance: opt-in, in the trailing (context) slot, parentheses inside it can't break it
+        remember("person", "Anna", "preference", "drinks coffee", source="2026-10-05 14:02 (voice)")
+        assert read_note("person", "anna") == ["- [preference] drinks coffee (2026-10-05 14:02 voice)"]
+        remember("person", "Anna", "preference", "likes rain")
+        assert read_note("person", "anna")[-1] == "- [preference] likes rain"
+        # supersede: quoted with or without category/source; ambiguous or absent changes nothing
+        assert drop_line("person", "Anna", "Drinks coffee") and read_note("person", "anna") == ["- [preference] likes rain"]
+        assert not drop_line("person", "Anna", "plays chess") and not drop_line("person", "nobody", "x")
+        remember("person", "Anna", "fact", "likes rain on Sundays")
+        assert not drop_line("person", "Anna", "rain") and len(read_note("person", "anna")) == 2  # two lines say it
+        assert not drop_line("person", "Anna", "on Sundays")  # too short to trust a partial match
+        assert read_note("person", "anna")[0] == "- [preference] likes rain"
+
+        # forget: the note named after it goes whole; mentions elsewhere go line by line; titles stay
+        remember("person", "Bob", "fact", "Anna's brother")
+        remember("person", "Bob", "fact", "plays the annapurna drum")  # not a whole-word match
+        day = ensure_note("journal", "2026-10-05", "Journal Anna day", "journal")
+        day.write_text(day.read_text() + "- [heard] 14:02 Anna: hi\n- [said] 14:02 hello\n")
+        assert forget("it") is None and forget("ME") is None and forget("an") is None
+        assert forget("anna") == 2 + 1 + 1
+        assert not (MIND_DIR / "people" / "anna.md").exists()
+        assert read_note("person", "bob") == ["- [fact] plays the annapurna drum"]
+        assert day.read_text().startswith("---\ntitle: Journal Anna day\n") and day.read_text().endswith("- [said] 14:02 hello\n")
+        assert forget("nobody here") == 0
+        remember("lesson", "health", "fact", "doctor visit at 3 on Friday")
+        assert forget("my doctor visit") == 1 and read_note("lesson", "health") == []
     finally:
         MIND_DIR, MEMORY_URL = orig_dir, orig_url
         shutil.rmtree(test_dir, ignore_errors=True)

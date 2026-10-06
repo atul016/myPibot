@@ -368,6 +368,10 @@ class SimBody:
     def glance(self) -> list[str]:
         return sorted({o.label for o, _, _ in self.w.visible() if o.label})
 
+    def heading(self) -> float:
+        """Degrees turned, + right -- what the real robot's IMU reports (the pose's h is + left)."""
+        return -math.degrees(self.w.pose.h)
+
     def drive(self, speed: float, steer_deg: float, seconds: float, reverse: bool = False,
               guard_cm: float = 10.0) -> tuple[str, float]:
         """Drive, checking the floor and the ultrasonic every TICK like the real

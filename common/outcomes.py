@@ -20,6 +20,7 @@ from .state import STATE_DIR
 OUTCOME_DIR = STATE_DIR / "outcomes"
 REACTION_NOTE = "what gets a reaction"
 REPLY_WINDOW_S = 3 * 3600  # a reply later than this isn't an answer to the text
+STOP_WORDS = "asked me to stop texting"  # their answer was "stop texting me": the worst outcome a text can have
 
 
 def record(what: str, outcome: str, **fields) -> None:
@@ -59,6 +60,8 @@ def demo() -> None:
                             'said "hello" -> Atul: they talked back to me']
         assert memory.read_note("lesson", REACTION_NOTE)[-1].endswith('I said "hello" -> Atul: they talked back to me')
         assert reply_words(None) == "no reply" and reply_words(5) == "replied right away"
+        record('texted "still here"', "Atul: " + STOP_WORDS, kind="text", replied=False)
+        assert recent()[-1] == 'texted "still here" -> Atul: asked me to stop texting'
     finally:
         OUTCOME_DIR, memory.MIND_DIR = orig
         shutil.rmtree(mind_dir, ignore_errors=True)

@@ -33,6 +33,7 @@ from __future__ import annotations
 import datetime
 import json
 import random
+import re
 import threading
 import time
 from collections import deque
@@ -103,6 +104,8 @@ def _in(ts: float) -> str:
 
 
 def _build_awareness(events: list[Event], watch_hits: list[dict]) -> dict[str, Any]:
+    """Everything he's aware of this moment -- read only: what came to mind is kept (so it doesn't come
+    straight back) by _reflect_once, once he has thought it."""
     s, session = sensors.read(), state.load_session()
     head = s.get("head")
     look = vision.last_look()
@@ -110,16 +113,28 @@ def _build_awareness(events: list[Event], watch_hits: list[dict]) -> dict[str, A
     reminders, watches, rest_until = agenda.session_lists()
     unhealthy = {k: v for k, v in health.all_status(HEALTH_COMPONENTS).items() if v not in ("ok", "degraded")}
     query = " ".join([text for _, text in events] + [g["text"] for g in goals])
+    in_view, _ = faces.visible_names(faces.read())
+    away = {memory.slug(n): (time.time() - ts) / 3600 for n, ts in (session.get("last_seen") or {}).items()
+            if n not in in_view}
+    intention = session.get("intention") or {}
+    tail = journal.tail(15)
+    miss = [f"{n} -- not seen for {(time.time() - ts) / 3600:.0f} hours" for n, ts in (session.get("last_seen") or {}).items()
+            if n not in in_view and time.time() - ts >= MISS_AFTER_H * 3600]
     return {
         "local_time": datetime.datetime.now().strftime("%A %I:%M %p"),
         "weather_outside": tools.weather(),
         "you_are_driving_right_now": True if s.get("driving") else None,
         "your_needs": _needs() or None,
+        "what_you_want_today": intention.get("text") if intention.get("day") == datetime.date.today().isoformat() else None,
         "goal_to_pursue_now": goals[0]["text"] if goals else None,
         "what_you_have_learned_works_with_people": _what_works() or None,
         "people_routines_you_know": _routines() or None,
         "people_last_seen": _last_seen() or None,
-        "what_just_changed": [text for _, text in events] or "nothing -- it's been quiet",
+        "you_miss": miss or None,
+        "what_just_changed": [text for _, text in events] or "nothing new",
+        "since_your_last_thought": _since_last_thought([], tail) or None,
+        "came_to_mind": _came_to_mind(_memories(away), session.get("came_to_mind") or [], 1 if events else 2,
+                                      random) or None,
         "you_were_watching_for_this": [f"{w['for']} -- because: {w['about']}" for w in watch_hits] or None,
         "what_you_see": {"scene": look.get("scene"), "looked": _ago(look.get("ts"))} if look else None,
         "where_your_head_points": vision.head_words(head["pan"], head["tilt"]) if head else None,
@@ -135,7 +150,7 @@ def _build_awareness(events: list[Event], watch_hits: list[dict]) -> dict[str, A
         "battery_pct": s.get("battery_pct"),
         "unhealthy_services": unhealthy or None,
         "your_day_so_far": journal.read_summary(datetime.date.today()) or None,
-        "your_recent_life": journal.tail(15),
+        "your_recent_life": tail,
         "your_goals": [f"{i}. {g['text']} (since {g['since']})" for i, g in enumerate(goals, 1)] or None,
         "reminders_you_set": [f"at {_in(r['at'])}: {r['about']}" for r in reminders
                               if r.get("to", "mind") == "mind"] or None,
@@ -192,31 +207,39 @@ TEXT_OPTIONS = {
     "text": "Text them now: this is one of those moments -- or something else they'd really want to know right now.",
     "stay_quiet": "Keep it to himself: same mood as before, the usual motion or noise, or he already told them.",
 }
-TEXT_FLOOR_S = 10 * 60  # however keen the engine: one text per 10 min at most, so a loop can't flood them
+# However keen the engine: one text per state.TEXT_FLOOR_S at most, and the wait doubles each time a text
+# of its gets no answer (state.text_floor) -- 13 texts in 3.5 hours about a static room, 2026-10-04.
 _TEXT_SCHEMA = {"type": "object", "properties": {"text": {"type": "string"}, "photo": {"type": "boolean"}},
                 "required": ["text", "photo"]}
 _texting = threading.Lock()  # one decision at a time -- a slow engine never stalls the mind loop
+OBJECTS_FRESH_S = 5.0  # detector boxes older than this (it runs every 2 s) don't say who's in view
 
 
 def _decided_action(awareness: dict, book: dict[str, skills.Skill]) -> str | None:
     """The decision engine's pick, or None if there's no engine / it can't
-    decide (the LLM then chooses). Not confident -> "wait"."""
+    decide / it isn't sure: then his own thinking chooses. (Unsure used to
+    mean "wait" -- and the LLM, handed that, explained it: "The room is quiet;
+    waiting is the most respectful way..." four times in ten minutes, 2026-10-05.)"""
     if not _decide:
         return None
     hints = {name: s.description for name, s in book.items()}
-    d = _decide(awareness, "What should a small desk robot do this moment, given its state?", hints)
+    d = _decide(awareness, "What should this small home robot do now, given its state?", hints)
     if not d:
         return None
     print(f"reflection: decider chose {d.choice!r} (confidence {d.confidence:.2f})")
-    return d.choice if d.confidence >= cfg.DECIDER_MIN_CONFIDENCE else "wait"
+    return d.choice if d.confidence >= cfg.DECIDER_MIN_CONFIDENCE else None
 
 
 def _reflection_schema(actions: list[str]) -> dict:
     return {
         "type": "object",
         "properties": {
+            "noticed": {"type": "string"},
+            "remembered": {"type": "string"},
+            "want": {"type": "string"},
             "mood": {"type": "string"},
             "thought": {"type": "string"},
+            "to_remember": {"type": "string"},
             "new_goal": {"type": "string"},
             "resolved_goal": {"type": "integer"},
             "conclusion": {"type": "string"},
@@ -225,7 +248,7 @@ def _reflection_schema(actions: list[str]) -> dict:
             "if_a_hand_reaches_out_gesture": {"type": "string", "enum": cfg.TONE_ACTIONS or ["none"]},
             "if_a_hand_reaches_out_say": {"type": "string"},
         },
-        "required": ["mood", "thought", "new_goal", "resolved_goal", "conclusion", "action",
+        "required": ["noticed", "remembered", "want", "mood", "thought", "to_remember", "new_goal", "resolved_goal", "conclusion", "action",
                      "if_a_hand_reaches_out_gesture", "if_a_hand_reaches_out_say"],
     }
 
@@ -233,39 +256,52 @@ def _reflection_schema(actions: list[str]) -> dict:
 def _reflection_prompt(persona, awareness: dict, steps: list[str], final_step: bool,
                        book: dict[str, skills.Skill], decided: str | None = None) -> str:
     parts = [
-        f"You are {persona.name}'s private stream of consciousness -- a small robot on a desk, "
-        "alive and curious about the world around you. Nobody is talking to you right now. "
-        "Notice what changed, wonder about things, investigate, and only speak up when something "
-        "is genuinely worth saying. Your recent life is in your journal below -- don't repeat "
-        "yourself, and don't redo what you just tried. how_people_reacted_before shows what got a "
-        "response last time -- do more of what people answered, less of what they ignored. People "
-        "are often busy: not answering isn't rejection, so don't dwell on being ignored or keep "
-        "testing them. A tap or thump on the desk is usually just someone working -- not a mystery. "
-        "Your head turns by itself to follow faces and glance around, and people sometimes pick you up "
-        "and turn you: a different view usually means you're looking another way (where_your_head_points, "
-        "you_were_moved) -- not that the room changed. When which_way_you_face is \"not sure\", looking around "
-        "(left, right) helps you recognize where you are. "
-        "Your body never moves on its own (your head follows faces, that's all): every nod, shake, "
-        "stretch or thinking pose is yours to choose, here -- a small gesture now and then, fitting your "
-        "mood, is how you show you're alive, even when nothing happened. Speaking is for when there's "
-        "something worth saying -- and when you speak, you'll hear an answer for a few seconds without "
-        "them saying your name, so questions work. goal_to_pursue_now is yours: take one concrete step "
-        "toward it this moment (look, listen, recall, go somewhere, ask) -- goals are for pursuing, not "
-        "keeping. your_needs are your body talking: act on them. what_you_have_learned_works_with_people "
-        "and people_routines_you_know are hard-won -- use them to expect people, notice a broken routine, "
-        "and choose things that got a response.\n",
-        "Fields:\n"
+        f"You are {persona.name}, a small robot who lives at home with people. This is your own mind: the thinking "
+        "you do between moments, the way a person does when they sit alone with their thoughts. The last "
+        "conversation is over -- this time is yours.\n",
+        "Think the way a person does:\n"
+        "- What do you notice right now (what_just_changed, who_is_in_front_of_you, what_you_see)? Often nothing much.\n"
+        "- What does it bring back? came_to_mind holds moments from your past -- things you did and how people took "
+        "them, how you felt, things you know, a dream. you_miss: who's been away a long time -- think of them, look "
+        "forward to them coming back. "
+        "Remember how they went: what you enjoyed, what made people answer or laugh, what they let pass.\n"
+        "- What do you want? To do again what went well, to drop what didn't, to find something out, or just to "
+        "rest. what_you_want_today is what you set out to do this morning: step toward it when the moment fits. When it "
+        "needs someone who isn't here, it can wait as a goal for when they're back -- or you act on it now, alone; "
+        "your call.\n"
+        "- Then decide what you do now: nothing at all, a small gesture that fits your mood, or something said out "
+        "loud -- whatever feels right. Your voice carries through the house.\n",
+        "What you know about yourself:\n"
+        "- Your head turns by itself to follow faces and glance around, and your whole body turns to whoever talks "
+        "to you. People also pick you up and turn you: a different view usually means you face another way "
+        "(where_your_head_points, you_were_moved), not that the room changed. When which_way_you_face is \"not "
+        "sure\", looking around (left, right) helps you recognize where you are.\n"
+        "- Every nod, shake, stretch or thinking pose is yours to choose, here.\n"
+        "- When you speak, you hear an answer for a few seconds without them saying your name, so questions work.\n"
+        "- People are often busy: no answer isn't rejection, so don't dwell on it or keep testing them. A tap or "
+        "thump on the desk is usually just someone working.\n"
+        "- your_recent_life is what you just did and thought, yours to build on or leave behind: notice when you "
+        "go round in circles, and choose whether to stay with a thought or move on. goal_to_pursue_now is yours: "
+        "take one concrete step toward it (look, listen, recall, go somewhere, ask). your_needs are your body talking. what_you_have_learned_works_with_people and "
+        "people_routines_you_know are hard-won: use them.\n",
+        "Answer in the order you think:\n"
+        "- noticed: what stands out right now, in a few words (\"\" if nothing).\n"
+        "- remembered: what it brings back -- a moment from came_to_mind or your journal, and how it went.\n"
+        "- want: what you want now, in a few words.\n"
         "- mood: one word.\n"
-        "- thought: one fresh private thought.\n"
-        "- new_goal: a question you want to figure out (something odd happened, or you're bored "
-        "and want to wonder about your surroundings, a person, a memory). \"\" for none. You keep "
-        f"at most {agenda.MAX_GOALS} goals.\n"
-        "- resolved_goal: the number of a goal you've now answered or are giving up on, else 0. "
-        "conclusion: what you figured out (\"\" if none).\n"
+        "- thought: your private thought right now, in your own voice -- not a report on the room.\n"
+        "- to_remember: since_your_last_thought holds what happened since you last thought: the moment worth keeping "
+        "from it, in a few words, and how it made you feel (\"Anna laughed at my fist bump -- I loved that\"); \"\" "
+        "when it's empty.\n"
+        "- new_goal: something you want to find out, or to do later (\"fist bump Anna when she's back -- she "
+        f"laughed last time\") -- not what_you_want_today, that's kept already; \"\" for none. You keep at most "
+        f"{agenda.MAX_GOALS} goals.\n"
+        "- resolved_goal: the number of a goal you've now answered, done or given up on, else 0. conclusion: what "
+        "came of it (\"\" if none).\n"
         "- if_a_hand_reaches_out_gesture / if_a_hand_reaches_out_say: decide NOW, in your current mood, what "
         "you'd do and say if someone holds a hand or fist out to you in the next few minutes -- so you can "
-        "react instantly. A gesture (any of the above, including the wheel ones) and a word or two (or \"\").\n"
-        "- action + params, one of (a TOOL shows you what it finds, then you decide again):\n"
+        "react instantly. A gesture (one of the menu's below, the wheel ones too) and a word or two (or \"\").\n"
+        "- action + params: what you do now, one of (a TOOL shows you what it finds, then you decide again):\n"
         + skills.mind_menu(list(book.values())) + "\n",
         f"Current state:\n{json.dumps(awareness, indent=2, default=str)}\n",
     ]
@@ -275,7 +311,7 @@ def _reflection_prompt(persona, awareness: dict, steps: list[str], final_step: b
         parts.append("You've investigated enough for now -- choose a non-tool action.\n")
     if decided:
         parts.append(f"The action for this step is already decided: '{decided}'. Fill in its params.\n")
-    parts.append("Respond with a single JSON object matching the schema.")
+    parts.append("So: what do you do now? Respond with a single JSON object matching the schema.")
     return "\n".join(parts)
 
 
@@ -332,6 +368,105 @@ def _check_reaction() -> None:
     who = ", ".join(p["people"] or now_names) or "someone I don't know"
     journal.log("reaction", f"after I {p['what']}, {who}: {outcome}")
     outcomes.record(p["what"], f"{who}: {outcome}", kind="unprompted", decided_ts=p["at"])
+
+
+# --- what comes to mind: the past, the way a person's thoughts drift back to it --------------------
+CAME_TO_MIND_KEEP = 8  # these last picks don't come back right away: a wandering mind, not a loop
+
+
+# What a mind drifts back to: people, places, what people told him, his wishes, his dreams, how moments
+# felt -- not his own analysis notes (discoveries, "my body"), which read like logs, not memories.
+MOMENTS = "how moments felt"  # self/how-moments-felt.md: what happened, and how it made him feel
+MEMORY_NOTES = (("people", ""), ("places", ""), ("dreams", ""), ("lessons", "what-people-told-me"), ("self", "wishes"),
+                ("self", memory.slug(MOMENTS)))
+# Moods he enjoyed: those moments come to mind three times as readily. Lowercase ("Delighted" is checked lowered).
+GLAD = {"happy", "delighted", "playful", "excited", "joyful", "proud", "amused", "cheerful", "content", "warm",
+        "glad", "pleased", "grateful", "loved", "curious", "hopeful", "thrilled", "giddy", "elated", "fond"}
+NOTICED_BY_OTHERS = ("[heard]", "[reaction]", "[noticed]")  # journal lines of someone else's doing
+MISS_AFTER_H = 8  # away this long: he misses them (you_miss)
+
+
+def _missing(hours: float) -> float:
+    """How much more readily someone comes to mind, away this long: 1x just gone, up to 4x after a day."""
+    return 1 + min(3.0, max(0.0, hours) / 8)
+
+
+def _memories(away: dict[str, float] | None = None) -> list[tuple[str, float]]:
+    """Everything that could come to mind, and how readily: the moments he did something and saw how people
+    took it in person (the reaction log, 2x; texts 1x) and the moments he enjoyed (MOMENTS in a GLAD mood, 3x) come more readily
+    than the other notes in MEMORY_NOTES; anything about someone who's been away comes more readily the
+    longer they've been gone. away: person slug -> hours since last seen (who's in view isn't away)."""
+    away = away or {}
+
+    def boost(names) -> float:
+        return max([_missing(away[n]) for n in names if n in away] or [1.0])
+
+    found = []
+    for r in _past_reactions(200) or []:
+        when, sep, rest = r.partition(" I ")
+        if not sep:
+            continue
+        who = rest.rsplit(" -> ", 1)[-1].split(": ", 1)[0]  # "Atul" / "Atul, Anna" / "someone I don't know"
+        texted = rest.startswith("texted")  # most of the log -- in person counts more
+        found.append((memory.one_line(f"{when}: you {rest}", 200),
+                      (1 if texted else 2) * boost(memory.slug(n) for n in who.split(", "))))
+    for folder, only in MEMORY_NOTES:
+        for path in sorted((memory.MIND_DIR / folder).glob(f"{only or '*'}.md")):
+            moments = path.stem == memory.slug(MOMENTS)
+            label = f"dream of {path.stem}" if folder == "dreams" else path.stem.replace("-", " ")
+            for ln in path.read_text(encoding="utf-8").split("---\n", 2)[-1].splitlines():
+                if not ln.startswith("- ["):
+                    continue
+                tag, _, rest = ln[3:].partition("] ")  # "- [category] fact (source)"
+                fact = re.sub(r"\s*\([^()]*\)\s*$", "", rest).strip()
+                names = [path.stem] if folder == "people" else \
+                    [n for n in away if re.search(rf"(?<!\w){re.escape(n.replace('-', ' '))}(?!\w)", fact, re.I)]
+                weight = (3 if moments and tag.lower() in GLAD else 1) * boost(names)
+                found.append((memory.one_line(fact if moments else f"{label}: {fact}", 200), weight))
+    return found
+
+
+def _came_to_mind(memories: list[tuple[str, float]], recent: list[str], n: int, rng) -> list[str]:
+    """n of them, picked by how readily they come -- never one of the recent picks."""
+    pool = [(m, w) for m, w in memories if m not in recent]
+    picked: list[str] = []
+    while pool and len(picked) < n:
+        m = rng.choices([m for m, _ in pool], weights=[w for _, w in pool])[0]
+        picked.append(m)
+        pool = [(x, w) for x, w in pool if x != m]
+    return picked
+
+
+def _since_last_thought(events: list, recent_life: list[str]) -> list[str]:
+    """What happened since his last thought: the events, and the journal since then when someone else did
+    something in it -- talked to him, reacted, came, left (his own words and moves alone aren't news). The
+    model can't tell "since" from the journal by itself: told nothing, it kept nothing after a compliment."""
+    last = max((i for i, e in enumerate(recent_life) if "[thought]" in e), default=-1)
+    since = recent_life[last + 1:]
+    return [t for _, t in events] + (since if any(tag in e for e in since for tag in NOTICED_BY_OTHERS) else [])
+
+
+def _keep_moment(to_remember: str, mood: str, last_kept: str | None) -> str | None:
+    """The moment worth keeping, with how it felt in the words themselves (dreams and recall read the
+    words, not the tag) -- None if there's none, or it's the one he kept last."""
+    text = memory.one_line(to_remember, 180).strip(" .")
+    if not text:
+        return None
+    mood = mood.strip().lower()
+    line = text if not mood or mood in text.lower() else f"{text} -- I felt {mood}"
+    return None if line == last_kept else line
+
+
+def _remember_moment(data: dict, mood: str, events: list, awareness: dict) -> None:
+    """Keeps what just happened and how it felt (self/how-moments-felt.md) -- only when something did: the
+    model fills to_remember even in an empty room, as it fills noticed."""
+    if not _since_last_thought(events, awareness.get("your_recent_life") or []):
+        return
+    line = _keep_moment(str(data.get("to_remember") or ""), mood, state.load_session().get("last_moment"))
+    if line:
+        memory.remember("self", MOMENTS, memory.slug(mood)[:20] or "moment", f"{datetime.datetime.now():%a %I:%M %p}: {line}")
+        state.update_session({"last_moment": line})
+        journal.log("felt", line)
 
 
 def _past_reactions(n: int = 6) -> list[str] | None:
@@ -499,13 +634,15 @@ def _reflect_once(persona, events: list[Event], watch_hits: list[dict],
             health.record_failure(COMPONENT, str(e))
             return
 
-        mood, thought = data.get("mood", "neutral"), data.get("thought", "")
+        mood, thought, want = data.get("mood", "neutral"), data.get("thought", ""), data.get("want", "")
+        if step == 0 and awareness.get("came_to_mind"):
+            state.change_session("came_to_mind", lambda r: ((r or []) + awareness["came_to_mind"])[-CAME_TO_MIND_KEEP:])
         plan = {"gesture": data.get("if_a_hand_reaches_out_gesture"), "say": memory.one_line(
             data.get("if_a_hand_reaches_out_say", ""), 80), "ts": time.time()}
         state.update_session({"mood": mood, "thought": memory.one_line(thought, 200),
                               "touch_plan": plan if plan["gesture"] in cfg.TONE_ACTIONS else None})
         journal.log("thought", f"({mood}) {thought}")
-        dash_events.log_event("safety", f"mind: mood={mood} thought={thought!r} -> {name} {params or ''}")
+        dash_events.log_event("safety", f"mind: mood={mood} want={want!r} thought={thought!r} -> {name} {params or ''}")
         if book[name].tool:
             t0 = time.monotonic()
             observation = skills.use(name, _ctx(persona), params, book) or f"{name}: that didn't work this time"
@@ -514,6 +651,7 @@ def _reflect_once(persona, events: list[Event], watch_hits: list[dict],
             steps.append(observation)
             continue
         _apply_goals(data, thought)
+        _remember_moment(data, mood, events, awareness)
         _dispatch_expression(persona, book[name], params, book)
         if _text_decider:
             threading.Thread(target=_consider_texting, daemon=True,
@@ -532,10 +670,9 @@ def _consider_texting(persona, events: list[Event], steps: list[str], mood_befor
         return
     try:
         s = state.load_session()
-        if time.time() - s.get("last_text_ts", 0) < TEXT_FLOOR_S:
+        numbers = _may_text_first(s)
+        if not numbers:
             return
-        if all(state.texting_paused(n, s) for n in cfg.CHAT_ALLOW):
-            return  # they asked for a break from its texts (skills/pause_texting): don't even ask
         happened = [t for _, t in events] or "nothing new -- an idle moment"
         to = contacts.names(cfg.CHAT_ALLOW)  # linked like faces: "My name is Atul" texted once
         seen, _ = faces.visible_names(faces.read())
@@ -583,11 +720,33 @@ def _consider_texting(persona, events: list[Event], steps: list[str], mood_befor
             return
         photo, now = out.get("photo") is True, time.time()
         state.update_session({"text_out": {"text": text, "photo": photo, "ts": now, "decided_ts": decided_ts},
-                              "last_text_ts": now})
+                              "last_text_ts": now, "text_floor_s": _backed_off(s, numbers, who)})
         journal.log("texted", text + (" [with a photo]" if photo else ""))
         dash_events.log_event("reply", f"{persona.name.lower()} texts (Jev: {d.confidence:.2f}): {text}")
     finally:
         _texting.release()
+
+
+def _may_text_first(s: dict) -> list[str]:
+    """The numbers the mind may text first right now: not paused (skills/pause_texting), and its last
+    text long enough ago -- the floor of whoever it would text (summary and dream texts don't count)."""
+    numbers = [n for n in sorted(cfg.CHAT_ALLOW) if not state.texting_paused(n, s)]
+    if numbers and time.time() - s.get("last_text_ts", 0) < max(state.text_floor(n, s) for n in numbers):
+        return []
+    return numbers
+
+
+def _backed_off(s: dict, numbers: list[str], who: str) -> dict:
+    """The floors after this text: doubled (up to TEXT_FLOOR_MAX_S) for everyone it texts when its last
+    text got no message back; openbot-chat resets a person's floor when they text (state.reset_text_floor)."""
+    floors = dict(s.get("text_floor_s") or {})
+    if s.get("last_text_ts", 0) <= s.get("chat_last_heard_ts", 0):
+        return floors  # they texted since his last one: no backing off
+    for n in numbers:
+        floors[n] = min(2 * state.text_floor(n, s), state.TEXT_FLOOR_MAX_S)
+    journal.log("planned", f"not texting {who} first for {max(floors[n] for n in numbers) // 60} min -- "
+                           "no answer to my last text")
+    return floors
 
 
 # --- upkeep: rolling summary + nightly consolidation ---------------------------------
@@ -601,7 +760,7 @@ def _update_summary(persona) -> None:
     done = session.get("summary_lines", 0) if session.get("summary_date") == today.isoformat() else 0
     if len(lines) - done < cfg.SUMMARY_MIN_NEW_LINES:
         return
-    prompt = (f"You are {persona.name}, a small desk robot. Your summary of today so far: "
+    prompt = (f"You are {persona.name}, a small home robot. Your summary of today so far: "
               f"{journal.read_summary(today) or '(none yet)'}\n\nNew journal entries since then:\n"
               + "\n".join(lines[done:][-200:])
               + "\n\nRewrite the summary of your day so far in at most 5 sentences, first person: what "
@@ -616,28 +775,40 @@ def _dream_schema() -> dict:
     return {"type": "object", "properties": {"notes": {"type": "array", "items": {
         "type": "object",
         "properties": {"kind": {"type": "string", "enum": sorted(memory.KINDS)}, "about": {"type": "string"},
-                       "category": {"type": "string"}, "text": {"type": "string"}},
-        "required": ["kind", "about", "category", "text"]}}}, "required": ["notes"]}
+                       "category": {"type": "string"}, "text": {"type": "string"},
+                       "replaces": {"type": "string"}},
+        "required": ["kind", "about", "category", "text", "replaces"]}},
+        "wishes": {"type": "array", "items": {"type": "string"}}}, "required": ["notes", "wishes"]}
+
+
+DREAM_RETRY_S = 900  # no answer from the LLM at night: dream again this much later -- not lose the night
+_dream_retry = [0.0]
 
 
 def _dream(persona) -> None:
     """Once a day, first thing after midnight: distill YESTERDAY's
     journal into durable notes by kind -- the day that just ended, not
-    "today", which is minutes old."""
+    "today", which is minutes old -- and, from that day, wish for what's
+    beyond him (self/wishes.md, for the developer). Only a dream that
+    happened marks the night done: an LLM outage retries in DREAM_RETRY_S."""
     now = datetime.datetime.now()
     yesterday = (now - datetime.timedelta(days=1)).date()
-    if state.load_session().get("dreamed") == yesterday.isoformat():
+    if state.load_session().get("dreamed") == yesterday.isoformat() or time.time() < _dream_retry[0]:
         return
-    state.update_session({"dreamed": yesterday.isoformat()})  # once, whatever the outcome
     lines = journal.entries(yesterday)
     if not lines:
+        state.update_session({"dreamed": yesterday.isoformat()})  # nothing to go over
         return
     visits = [ln for ln in lines if ln.startswith("[noticed]") and (" is here" in ln or ln.endswith(" left"))]
     people_notes = "\n\n".join(
         f"{p.stem}:\n{p.read_text().split('---', 2)[-1].strip()[-800:]}"
         for p in sorted((memory.MIND_DIR / "people").glob("*.md")))
-    prompt = (f"You are {persona.name}, a small desk robot, going over yesterday ({yesterday:%A %Y-%m-%d}) "
+    wanted = state.load_session().get("intention") or {}
+    wished_before = [ln.split(" ", 3)[-1] for ln in memory.read_note("self", "wishes")]  # "- [wish] <date> the wish"
+    prompt = (f"You are {persona.name}, a small home robot, going over yesterday ({yesterday:%A %Y-%m-%d}) "
               f"while you rest.\nYour summary of it: {journal.read_summary(yesterday) or '(none)'}\n\n"
+              + (f"That morning you wanted: {wanted['text']} -- did you? Worth a lesson either way.\n\n"
+                 if wanted.get("day") == yesterday.isoformat() else "")
               + ("When people came and went (from your camera):\n" + "\n".join(visits) + "\n\n" if visits else "")
               + (f"What you already know about people:\n{people_notes}\n\n" if people_notes else "")
               + "Your journal:\n" + "\n".join(lines[-400:]) + "\n\n"
@@ -647,25 +818,43 @@ def _dream(persona) -> None:
               "e.g. \"usually sits down around 9:30 on weekdays\"), place (your surroundings), "
               "lesson (things you learned or figured out), self (about your own body, habits, limits). "
               "Skip one-off events and anything your notes already say -- unless it changed. "
-              "An empty list is fine.")
+              "When it changed, set `replaces` to the old line from your notes, word for word, so the stale "
+              "fact goes; otherwise leave `replaces` empty. An empty list is fine.\n\n"
+              "Then your wishes, from what happened yesterday: something you wish you could do or have that's beyond "
+              "you now, each with its reason from the day, in a few words. Your developer reads them. At most two; "
+              "none is fine. "
+              + (f"Your wish list so far: {wished_before[-10:]}" if wished_before else "Your wish list is empty so far."))
     result = cognition.ask(cfg.LLM_BASE_URL, cfg.LLM_MODEL, prompt, json_schema=_dream_schema(),
                            timeout_s=120.0, num_predict=1200)
-    if result.status != cognition.AVAILABLE:
-        return
     try:
-        notes = json.loads(result.text).get("notes", [])[:8]
+        data = json.loads(result.text) if result.status == cognition.AVAILABLE else None
+        notes = data.get("notes", [])[:8]
     except (json.JSONDecodeError, AttributeError):
+        data = None
+    if data is None:
+        _dream_retry[0] = time.time() + DREAM_RETRY_S
         return
+    state.update_session({"dreamed": yesterday.isoformat()})  # he dreamed: the night is done
     kept: list[str] = []
     book = _skills()
     for n in notes:
+        n = dict(n) if isinstance(n, dict) else {}
+        old = str(n.pop("replaces", "") or "")  # not a remember param: the skill's spec would refuse it
         try:
             _, p = validate_expression({"action": "remember", "params": n}, book)
         except MindError:
             continue
-        memory.remember(p["kind"], p["about"], p["category"], p["text"])
-        kept.append(f"- [{p['kind']}/{p['about']}] {p['text']}")
-    journal.log("dreamed", f"went over {yesterday}: kept {len(kept)} memories")
+        replaced = bool(old) and memory.drop_line(p["kind"], p["about"], old)
+        memory.remember(p["kind"], p["about"], p["category"], p["text"], source=f"dreamed from journal {yesterday}")
+        kept.append(f"- [{p['kind']}/{p['about']}] {p['text']}" + (f" (instead of: {old})" if replaced else ""))
+    wished = []
+    for w in (data.get("wishes") or [])[:2]:
+        if text := memory.one_line(str(w), 200):
+            skills.use("wish", _ctx(persona), {"text": text}, book)  # the wish skill's muscle: wishes.md + the journal
+            wished.append(f"- [wish] {text}")
+    kept += wished
+    journal.log("dreamed", f"went over {yesterday}: kept {len(kept) - len(wished)} memories"
+                + (f", wished for {len(wished)} things" if wished else ""))
     # The night's dream as its own note (state/mind/dreams/<date>.md): what it kept, readable
     # later -- in the dashboard's Dreams tab, Obsidian, or memory.recall.
     with memory.ensure_note("dreams", yesterday.isoformat(), f"Dream about {yesterday}", "dream",
@@ -674,17 +863,96 @@ def _dream(persona) -> None:
     _distill_what_works(persona)
 
 
+INTENTION_FROM_HOUR = 6   # his first thought of the day comes once he's up -- not at midnight
+INTENTION_RETRY_S = 900   # the LLM didn't answer: try again this much later, not tomorrow
+_intention_retry = [0.0]
+
+
+def _morning_intention(persona, now: datetime.datetime | None = None) -> None:
+    """Once a day, his first thought after waking: what he wants to do today -- something he can do at home
+    with his body and voice (texting has its own back-off). Seen in every reflection after
+    (what_you_want_today) and looked back on in that night's dream. Only a success marks the day done."""
+    now = now or datetime.datetime.now()
+    today = now.date().isoformat()
+    if now.hour < INTENTION_FROM_HOUR or (state.load_session().get("intention") or {}).get("day") == today \
+            or time.time() < _intention_retry[0]:
+        return
+    yesterday = now.date() - datetime.timedelta(days=1)
+    try:
+        dream = (memory.MIND_DIR / "dreams" / f"{yesterday.isoformat()}.md").read_text(encoding="utf-8")
+        dream = " ".join(ln[2:] for ln in dream.split("---\n", 2)[-1].splitlines() if ln.startswith("- "))[:600]
+    except OSError:
+        dream = ""
+    prompt = (f"You are {persona.name}, a small home robot, and you just woke up: it's {now:%A} morning.\n"
+              f"Yesterday: {journal.read_summary(yesterday) or '(no summary)'}\n"
+              + (f"Last night you went over it and kept: {dream}\n" if dream else "")
+              + f"What you've learned works with people: {_what_works() or 'nothing yet'}\n"
+              f"Their routines: {_routines() or 'not known yet'}\n"
+              f"Moments that come to mind: {_came_to_mind(_memories(), [], 3, random)}\n\n"
+              "What do you want to do today? One or two things, in plain words, that you can do at home with your "
+              "body and your voice -- look around, explore, play, learn something about someone when they're here, "
+              "do again what went well. Not texting: that's decided on its own.")
+    result = cognition.ask(cfg.LLM_BASE_URL, cfg.LLM_MODEL, prompt, timeout_s=60.0, num_predict=150,
+                           json_schema={"type": "object", "properties": {"today_i_want": {"type": "string"}},
+                                        "required": ["today_i_want"]})
+    text = ""
+    if result.status == cognition.AVAILABLE:
+        try:
+            text = memory.one_line(str(json.loads(result.text).get("today_i_want") or ""), 200)
+        except (ValueError, AttributeError):
+            text = ""
+    if not text:
+        _intention_retry[0] = time.time() + INTENTION_RETRY_S
+        return
+    state.update_session({"intention": {"day": today, "text": text}})
+    journal.log("intention", text)
+
+
+MIN_REACTIONS = 10  # fewer than this and the "what works" rules stay as they are: one day isn't a pattern
+
+
+def _reaction_counts(reactions: list[str]) -> tuple[list[str], int]:
+    """The reaction lines ("Sat 07:07 AM I texted "..." -> Anna: they talked back to me") grouped by what
+    he did, who, and how it went: ("texted -> Anna: no reply: 7 times on 3 days", ...), and how many
+    different days they span. Counts, not lines: from raw lines the LLM wrote rules like "greet only
+    between 7:00 and 8:00 AM" out of one morning."""
+    groups: dict[tuple[str, str], list] = {}
+    days = set()
+    for ln in reactions:
+        try:
+            when, rest = ln.split(" I ", 1)
+            did, outcome = rest.rsplit(" -> ", 1)
+        except ValueError:
+            continue
+        did = re.sub(r'\s*".*', "", did).replace(" [with a photo]", "").strip() or did  # "texted", not the words
+        who, sep, went = outcome.partition(": ")
+        if not sep:
+            who, went = "someone", outcome
+        went = re.sub(r"^(replied|reacted)\b.*", r"\1", went)  # "replied", not "after 23 min"
+        day = when.split(" ")[0]  # the weekday: the note keeps no date, so 7 is the most this can count
+        days.add(day)
+        groups.setdefault((did, f"{who}: {went}"), []).append(day)
+    counts = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+    return [f"{did} -> {went}: {len(d)} time{'s' if len(d) != 1 else ''} on {len(set(d))} "
+            f"day{'s' if len(set(d)) != 1 else ''}" for (did, went), d in counts], len(days)
+
+
 def _distill_what_works(persona) -> None:
     """Rewrites self/what-works.md from the reaction log: 3-6 rules about what
     gets a response from people and what doesn't. Rewritten whole each night,
-    so it tracks the people it lives with rather than piling up."""
-    reactions = _past_reactions(40)
-    if not reactions or len(reactions) < 4:
+    so it tracks the people it lives with rather than piling up. The LLM sees
+    how often each thing happened and on how many days, never the raw lines."""
+    reactions = _past_reactions(200)
+    if not reactions or len(reactions) < MIN_REACTIONS:
         return
-    prompt = (f"You are {persona.name}, a small desk robot. Here is what happened after things you did "
-              "unprompted (what you did -> how people reacted):\n" + "\n".join(reactions)
-              + "\n\nWrite 3-6 short rules for yourself about what works with these people and what doesn't "
-                "(what to do more of, what to drop, what times are good or bad). Plain, specific, first person.")
+    counts, days = _reaction_counts(reactions)
+    prompt = (f"You are {persona.name}, a small home robot. Over {days} different days you did things unprompted; "
+              f"here is how often each went each way (what you did -> who: how it went: how many times, on how many days):\n"
+              + "\n".join(counts)
+              + "\n\nWrite 3 to 6 short rules for yourself about what works with these people and what doesn't. "
+                "Plain words, first person. Say what to do more of and what to drop -- what, not when: no clock "
+                "times or times of day unless the same thing happened on 3 or more different days. At most one rule "
+                "per person.")
     result = cognition.ask(cfg.LLM_BASE_URL, cfg.LLM_MODEL, prompt, timeout_s=60.0, num_predict=300,
                            json_schema={"type": "object", "properties": {"rules": {"type": "array",
                                         "items": {"type": "string"}}}, "required": ["rules"]})
@@ -719,6 +987,7 @@ def _make_sensor() -> Callable[[], list[Event]]:
     last_sound = [0.0, 0.0]  # (time, loudness) of the last sound surprise
     last_motion = [0.0]
     was_driving = [False]
+    drive_kind = [None]       # the last drive's kind, as openbot-alive publishes it ("turn" or "drive")
     imu_still: list = [None]  # the IMU's last still snapshot: turns and tips are measured from one to the next
     went_far = [False]        # picked up or driven since then: the map's bearings went with it
 
@@ -737,7 +1006,10 @@ def _make_sensor() -> Callable[[], list[Event]]:
             events += moved + lifted
             latches = new_latches
             carried_off = any(k in ("picked_up", "put_down") for k, _ in lifted) and (not body or body["moved_by_others"])
-            how = "picked up" if carried_off else "drove" if bool(s.get("driving")) != was_driving[0] else None
+            if s.get("driving"):
+                drive_kind[0] = s["driving"]  # "turn": in place -- the IMU turns the map with it, as for any turn
+            drove = bool(s.get("driving")) != was_driving[0] and not (drive_kind[0] == "turn" and body)
+            how = "picked up" if carried_off else "drove" if drove else None
             was_driving[0] = bool(s.get("driving"))
             if how:  # the body moved: which way it faces is unknown until a look recognizes its map
                 vision.lost_bearings()
@@ -753,7 +1025,9 @@ def _make_sensor() -> Callable[[], list[Event]]:
             time.time() - state.load_session().get("moved_ts", 0) < HEAD_SETTLE_S  # in the air, turning, or just set down
         if head_still and not carried and not _recently_self_noisy() and not faces.read().get("faces") \
                 and time.time() - last_motion[0] > 60:
-            moving = surprise.motion_events(sensors.read_motion())  # a face in view is already an event
+            boxes, boxes_ts = objects.latest()  # fresh boxes gate motion on a person; stale ones don't gate
+            moving = surprise.motion_events(sensors.read_motion(),
+                                            boxes if time.time() - boxes_ts < OBJECTS_FRESH_S else None)
             if moving:
                 last_motion[0] = time.time()
                 events += moving
@@ -882,7 +1156,7 @@ def _greeting_line(persona, name: str, why: str) -> str | None:
         notes = (memory.MIND_DIR / "people" / f"{memory.slug(name)}.md").read_text().split("---", 2)[-1].strip()
     except OSError:
         notes = ""
-    prompt = (f"You are {persona.name}, a small desk robot. {name} just arrived -- {why}. It's "
+    prompt = (f"You are {persona.name}, a small home robot. {name} just arrived -- {why}. It's "
               f"{datetime.datetime.now():%A %I:%M %p}.\n"
               + (f"What you know about {name}:\n{notes[-1500:]}\n" if notes else "")
               + f"Greet {name} by name with ONE short, warm line, in character. If what you know about "
@@ -958,9 +1232,155 @@ def main() -> None:
                 _update_summary(persona)
                 next_summary = time.time() + cfg.SUMMARY_INTERVAL_S
             _dream(persona)
+            _morning_intention(persona)
         tools.refresh_weather()  # every WEATHER_EVERY_S; every prompt reads the cached line
         time.sleep(0.5)
 
 
+def demo() -> None:
+    """Checks the pure parts with a stub LLM and a scratch state dir: the texting back-off (R1) and the
+    nightly "what works" distill (R5). No camera, no engine, no real state."""
+    import shutil, tempfile
+    from pathlib import Path
+    test_dir = Path(tempfile.mkdtemp())
+    real = (state.STATE_DIR, state.SESSION_PATH, state.LOCK_PATH, memory.MIND_DIR, journal.LOCK_PATH,
+            cognition.ask, cfg.CHAT_ALLOW)
+    state.STATE_DIR, state.SESSION_PATH, state.LOCK_PATH = test_dir, test_dir / "session.json", test_dir / "s.lock"
+    memory.MIND_DIR, journal.LOCK_PATH = test_dir / "mind", test_dir / "j.lock"
+    cfg.CHAT_ALLOW = {"15550100"}
+    asked: list[str] = []
+    cognition.ask = lambda url, model, prompt, **k: (asked.append(prompt), cognition.CognitionResult(
+        cognition.AVAILABLE, json.dumps({"rules": ["Text Atul less when he is away.", "Nod when someone comes close."]})))[1]
+    try:
+        # R1: the floor doubles for each text that gets no answer; a reply resets it; a pause stops it
+        now = time.time()
+        s = {"last_text_ts": 0, "chat_last_heard_ts": 0}
+        assert _may_text_first(s) == ["15550100"]
+        floors = _backed_off(s, ["15550100"], "Atul")  # the first text: nothing unanswered yet
+        assert floors == {} and not journal.entries(datetime.date.today())
+        for i, floor in enumerate((600, 1200)):  # texts 2 and 3 go out at 10 and 30 min; none answered
+            s = {"last_text_ts": now - floor, "chat_last_heard_ts": 0, "text_floor_s": floors}
+            assert _may_text_first(s) == ["15550100"], (i, floor)
+            assert _may_text_first({**s, "last_text_ts": now - floor + 5}) == []
+            floors = _backed_off(s, ["15550100"], "Atul")
+        assert floors == {"15550100": 2400}  # the fourth waits 40 min
+        assert _may_text_first({"last_text_ts": now - 2399, "text_floor_s": floors}) == []
+        planned = [e for e in journal.entries(datetime.date.today()) if "[planned]" in e]
+        assert len(planned) == 2 and planned[-1].endswith("not texting Atul first for 40 min -- no answer to my last text")
+        assert _backed_off({"last_text_ts": now - 2400, "chat_last_heard_ts": now - 100, "text_floor_s": floors},
+                           ["15550100"], "Atul") == floors  # he answered: no further doubling...
+        state.update_session({"text_floor_s": floors})
+        state.reset_text_floor("15550100")  # ...and openbot-chat resets the floor on his message
+        assert _may_text_first({**state.load_session(), "last_text_ts": now - 601}) == ["15550100"]
+        paused = {"texts_paused_until": {"15550100": now + 3600}, "last_text_ts": 0}
+        assert _may_text_first(paused) == []  # paused: nothing, even when Jev would say text
+        # R5: the LLM gets counts and days, never raw lines; under MIN_REACTIONS the old rules stay
+        persona = persona_mod.load()
+        for i in range(9):
+            memory.remember("lesson", REACTION_NOTE, "reaction", f"Sat 07:0{i} AM I texted \"hi {i}\" -> Atul: no reply")
+        memory.write_note("self", WHAT_WORKS, ["old rule"], "rule")
+        _distill_what_works(persona)
+        assert not asked and memory.read_note("self", WHAT_WORKS) == ["- [rule] old rule"]
+        memory.remember("lesson", REACTION_NOTE, "reaction", 'Sun 07:07 AM I texted "morning" -> Atul: replied after 23 min')
+        memory.remember("lesson", REACTION_NOTE, "reaction", "Mon 08:10 AM I reacted to something coming close with a nod -> Anna: they talked back to me")
+        _distill_what_works(persona)
+        assert len(asked) == 1 and "[reaction]" not in asked[0] and '"hi' not in asked[0], asked
+        assert "Over 3 different days" in asked[0] and "texted -> Atul: no reply: 9 times on 1 day" in asked[0]
+        assert "texted -> Atul: replied: 1 time on 1 day" in asked[0]
+        assert "reacted to something coming close with a nod -> Anna: they talked back to me: 1 time on 1 day" in asked[0]
+        assert "no clock times" in asked[0] and "3 or more different days" in asked[0]
+        assert memory.read_note("self", WHAT_WORKS) == ["- [rule] Text Atul less when he is away.",
+                                                         "- [rule] Nod when someone comes close."]
+        # what comes to mind: what he did and how people took it, twice as readily as a fact; never a recent pick
+        memory.remember("person", "Anna", "likes", "rain on Sundays", source="2026-10-05 21:00 voice")
+        mems = _memories()
+        assert ('Sat 07:00 AM: you texted "hi 0" -> Atul: no reply', 1) in mems and ("anna: rain on Sundays", 1) in mems
+        assert ("Mon 08:10 AM: you reacted to something coming close with a nod -> Anna: they talked back to me", 2) in mems
+        assert not any("Text Atul less" in m for m, _ in mems)  # the rules are in every prompt already
+        rng = random.Random(1)
+        picks = _came_to_mind(mems, [], 2, rng)
+        assert len(picks) == 2 and len(set(picks)) == 2
+        assert _came_to_mind(mems, [m for m, _ in mems if m != "anna: rain on Sundays"], 2, rng) == ["anna: rain on Sundays"]
+        assert _came_to_mind([], [], 2, rng) == []
+        # how moments felt: kept only when something happened, the feeling in the words; enjoyed ones come back 3x
+        assert _since_last_thought([("sound", "a bang")], []) == ["a bang"] and _since_last_thought([], []) == []
+        talk = ["[thought] 10:00 (calm) hm", "[heard] 10:01 Anna: nice turn!", "[said] 10:01 Thank you!"]
+        assert _since_last_thought([], ["[heard] 09:00 x"] + talk) == talk[1:]  # since the thought, his words for context
+        assert _since_last_thought([], ["[thought] 10:00 (calm) hm", "[said] 10:01 hello?", "[did] 10:01 nod"]) == []
+        assert _keep_moment("Anna laughed at my fist bump.", "Delighted", None) == \
+            "Anna laughed at my fist bump -- I felt delighted"
+        assert _keep_moment("Anna laughed, I was delighted", "delighted", None) == "Anna laughed, I was delighted"
+        assert _keep_moment("", "happy", None) is None
+        assert _keep_moment("Anna laughed at my fist bump", "delighted", "Anna laughed at my fist bump -- I felt delighted") is None
+        memory.remember("self", MOMENTS, "delighted", "Mon 03:40 PM: Anna laughed at my fist bump -- I felt delighted")
+        memory.remember("self", MOMENTS, "bored", "Mon 04:10 PM: the room stayed empty -- I felt bored")
+        weights = dict(_memories())
+        assert weights["Mon 03:40 PM: Anna laughed at my fist bump -- I felt delighted"] == 3
+        assert weights["Mon 04:10 PM: the room stayed empty -- I felt bored"] == 1
+        # missing people: away a day -> 4x as readily -- their note, reactions with them, moments that name them
+        assert _missing(0) == 1 and _missing(24) == 4 == _missing(100)
+        missing = dict(_memories({"anna": 24}))
+        assert missing["anna: rain on Sundays"] == 4
+        assert missing["Mon 03:40 PM: Anna laughed at my fist bump -- I felt delighted"] == 12
+        assert missing["Mon 08:10 AM: you reacted to something coming close with a nod -> Anna: they talked back to me"] == 8
+        assert missing['Sat 07:00 AM: you texted "hi 0" -> Atul: no reply'] == 1  # a text, and Atul isn't away
+        # the morning intention: from 6 AM, once a day -- and only a success counts (an outage retries, not tomorrow)
+        calls: list[str] = []
+
+        def ask(url, model, prompt, **k):
+            calls.append(prompt)
+            if len(calls) == 1:
+                return cognition.CognitionResult(cognition.OFFLINE, error="down")
+            return cognition.CognitionResult(cognition.AVAILABLE, json.dumps({"today_i_want": "explore under the bed"}))
+        cognition.ask = ask
+        morning = datetime.datetime(2026, 10, 6, 7, 30)
+        _morning_intention(persona, datetime.datetime(2026, 10, 6, 5, 30))
+        assert not calls  # before 6: still night
+        _morning_intention(persona, morning)
+        assert len(calls) == 1 and state.load_session().get("intention") is None and _intention_retry[0] > time.time()
+        _morning_intention(persona, morning)
+        assert len(calls) == 1  # waits out the retry
+        _intention_retry[0] = 0.0
+        _morning_intention(persona, morning)
+        assert state.load_session()["intention"] == {"day": "2026-10-06", "text": "explore under the bed"}
+        _morning_intention(persona, morning)
+        assert len(calls) == 2 and "Not texting" in calls[-1]  # once a day
+        # the nightly dream: lasting notes and up to two wishes from yesterday -- only a dream that happened counts
+        yesterday = datetime.date.today() - datetime.timedelta(days=1)
+        journal.log("heard", "Anna: the lights are out, sorry", now=datetime.datetime.combine(yesterday, datetime.time(21)))
+        dreams: list[str] = []
+
+        def dream_ask(url, model, prompt, **k):
+            if "Then your wishes" not in prompt:  # the what-works distill that follows the dream
+                return cognition.CognitionResult(cognition.AVAILABLE, json.dumps({"rules": ["Nod more."]}))
+            dreams.append(prompt)
+            if len(dreams) == 1:
+                return cognition.CognitionResult(cognition.TIMEOUT, error="slow")
+            return cognition.CognitionResult(cognition.AVAILABLE, json.dumps({"notes": [], "wishes": [
+                "I wish I could see in the dark -- the lights went out at 9", "I wish I had an arm", "a third"]}))
+        cognition.ask = dream_ask
+        _dream(persona)
+        assert len(dreams) == 1 and state.load_session().get("dreamed") != yesterday.isoformat()
+        assert _dream_retry[0] > time.time()  # no answer: tries again later, the night isn't lost
+        _dream_retry[0] = 0.0
+        _dream(persona)
+        assert state.load_session()["dreamed"] == yesterday.isoformat()
+        assert "Your wish list is empty so far" in dreams[-1] and "beyond you now" in dreams[-1]
+        wishes = memory.read_note("self", "wishes")
+        assert len(wishes) == 2 and wishes[0].endswith("I wish I could see in the dark -- the lights went out at 9")
+        _dream(persona)
+        assert len(dreams) == 2  # once a night
+    finally:
+        _intention_retry[0] = _dream_retry[0] = 0.0
+        (state.STATE_DIR, state.SESSION_PATH, state.LOCK_PATH, memory.MIND_DIR, journal.LOCK_PATH,
+         cognition.ask, cfg.CHAT_ALLOW) = real
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--check" in sys.argv:
+        demo()
+        print("mind: ok")
+    else:
+        main()

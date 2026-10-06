@@ -36,9 +36,9 @@ import common.system  # noqa: F401 -- side effect, harmless even though this pro
 
 import config as cfg  # noqa: E402
 from common import cognition, events as dash_events, health, mic_stream, persona as persona_mod  # noqa: E402
-from common import agenda, faces, journal, memory, react, reply_schema, sensors, skills, speak_client as speak_mod, state, vision  # noqa: E402
-from common import hearing, voices  # noqa: E402
-from common.motor_client import dispatch as motor_dispatch  # noqa: E402
+from common import agenda, faces, journal, memory, policy, react, reply_schema, sensors, skills, speak_client as speak_mod, state, vision  # noqa: E402
+from common import hearing, objects, voices  # noqa: E402
+from common.motor_client import dispatch as motor_dispatch, look_toward, navigate as motor_navigate  # noqa: E402
 from common.speak_client import speak as speak_client  # noqa: E402
 from common import stt  # noqa: E402
 from common.stt import MIC_RATE, VOSK_RATE, resample_pcm  # noqa: E402
@@ -104,6 +104,44 @@ def _started(heard: str) -> bool:
     return len(heard.split()) >= 2 or bool(stt.reject_hallucination(heard))
 
 
+# When the last thing heard was said (wall clock: from just before it started to when it
+# ended) -- which way it came from is read for that window (hearing.voice_bearing), not
+# for the seconds of thinking after it, when nobody is talking any more. And which way the
+# body faced as they began (the IMU): turned since, that direction was heard from elsewhere.
+_heard_window = [0.0, 0.0]
+_heard_heading: list = [None]
+GLANCE_MIN_DEG = 15  # a voice about straight ahead: the head stays where it is
+TURN_MIN_DEG = 30    # further round than this, the whole body turns to them
+
+
+def _heading() -> float | None:
+    return (sensors.read().get("imu") or {}).get("heading")
+
+
+def _toward_voice(t0: float, t1: float) -> None:
+    """Face whoever just spoke: the whole body when they're well round to the side (a quiet
+    turn -- the conversation does the talking), else just the head. Not when the one in view
+    is the one talking (alive's face tracker keeps them there, and turns the body when they're
+    far round), nor when the body turned while they talked."""
+    bearing = hearing.voice_bearing(t0, t1)
+    if bearing is None or abs(bearing) < GLANCE_MIN_DEG:
+        return
+    s = sensors.read()
+    in_view = faces.read().get("faces") or any(o["name"] == "person" for o in objects.read(max_age_s=3.0))
+    if in_view and abs(bearing - (s.get("head") or {}).get("pan", 0.0)) <= faces.FOV_DEG[0] / 2 + 15:
+        return
+    heading, then = (s.get("imu") or {}).get("heading"), _heard_heading[0]
+    if s.get("driving") or (heading is not None and then is not None and abs(heading - then) > 10):
+        return
+    if cfg.CAN_DRIVE and abs(bearing) >= TURN_MIN_DEG and policy.evaluate("motion").allowed:
+        ok, err = motor_navigate({"turn": bearing, "quiet": True})
+        print(f"turn: their voice came from {bearing:+.0f} degrees -- {'turning to face them' if ok else err}")
+        if ok:
+            return
+    print(f"glance: their voice came from {bearing:+.0f} degrees (+ right)")
+    look_toward(bearing)
+
+
 def _listen(mic: mic_stream.ArecordStream, onset_timeout_s: float, seed: bytes = b"",
             speculate=None, spec_out: dict | None = None, stop=None) -> tuple[bytes, str]:
     """Waits (patiently, up to onset_timeout_s) for someone to start talking,
@@ -139,6 +177,7 @@ def _listen(mic: mic_stream.ArecordStream, onset_timeout_s: float, seed: bytes =
             if _started(res.get("text", "")):
                 if not started_at:
                     started_at, captured = now, ([seed] if seed else []) + list(preroll)
+                    _heard_heading[0] = _heading()
                 results.append(res)
                 pause_until, extended = now + PAUSE_S, False
                 if speculate is not None and _whisper is not None:
@@ -152,6 +191,7 @@ def _listen(mic: mic_stream.ArecordStream, onset_timeout_s: float, seed: bytes =
             if _started(heard):
                 if not started_at:
                     started_at, captured = now, ([seed] if seed else []) + list(preroll)
+                    _heard_heading[0] = _heading()
                 pause_until = None  # still talking
                 if spec is not None:
                     spec.cancel()  # not the end after all
@@ -168,12 +208,15 @@ def _listen(mic: mic_stream.ArecordStream, onset_timeout_s: float, seed: bytes =
             pause_until, extended = now + UNFINISHED_EXTRA_S, True  # probably looking for the next word
         if (pause_until and now >= pause_until) or now - started_at > MAX_RECORD_S:
             break
+    ended_at = time.time()
     if not pause_until:  # cut off by MAX_RECORD_S mid-phrase
         results.append(json.loads(rec.FinalResult()))
     audio = b"".join(captured)
     if started_at:
         speak_mod.warm()  # amp on now, while we transcribe and think -- not after
     heard_from = (started_at or time.time()) - PREROLL_CHUNKS * chunk_frames / mic.rate - 1.0
+    if started_at:
+        _heard_window[:] = [heard_from, ended_at]
     if spec is not None and pause_until and spec_out is not None:
         text = spec.transcript()
         if text:
@@ -587,16 +630,20 @@ def _run_turn(persona, Reply, user_text: str, history: list[dict],
     _voice_speaker = None
     if audio and _voices is not None:
         pcm16k = resample_pcm(audio, MIC_RATE, VOSK_RATE)
-        if who:  # learned in the background: no reply waits for it
+        boxes, boxes_ts = objects.latest()
+        if who and voices.can_teach(faces.read(), boxes, boxes_ts):  # learned in the background: no reply waits
             threading.Thread(target=_learn_voice, args=(who, pcm16k), daemon=True).start()
         else:
-            who = _voice_speaker = _whose_voice(pcm16k)
-            if who and spec is not None:  # the reply written ahead didn't know who was talking
+            _voice_speaker = _whose_voice(pcm16k)
+            who = voices.speaker(who, _voice_speaker, boxes, boxes_ts)  # the voice, else the face if they're alone
+            if _voice_speaker and spec is not None:  # the reply written ahead didn't know who was talking
                 spec.cancel()
                 spec = None
     journal.log("heard", f"{who}: {user_text}" if who else user_text)
 
     _learn_face(user_text)
+    if (denied := voices.denied_name(user_text)) and voices.forget_last(denied):
+        journal.log("learned", f"that voice was not {denied}'s -- they told me")
 
     plan = spec.plan_for(user_text) if spec is not None else None
     if plan is None:
@@ -605,7 +652,10 @@ def _run_turn(persona, Reply, user_text: str, history: list[dict],
             spec = None
         plan = _plan(persona, user_text, history)
     actions, refused = plan
-    ctx = {"channel": "voice", "who": who, "stopped": stopped}
+    book = skills.load()
+    if not stopped and not any(a.skill == "look" or "body" in book[a.skill].needs for a in actions if a.skill in book):
+        _toward_voice(*_heard_window)  # (a skill that drives or moves the head does its own -- facing them would fight it)
+    ctx = {"channel": "voice", "who": who, "stopped": stopped, "heard": tuple(_heard_window)}
     out: dict = {}
     if actions or refused:
         if spec is not None:
@@ -761,7 +811,11 @@ def _on_wake(persona, Reply, mic: mic_stream.ArecordStream, seed: bytes) -> None
     if it comes, Whisper transcribes the whole thing (from "Rocky" on, via
     `seed`) and that's the first turn, no greeting. While asleep, wake only if
     Whisper actually heard "wake up" (the grammar invented it from "be quiet")."""
+    woke_at, woke_heading = time.time(), _heading()
+    said_from = woke_at - len(seed) / (2 * MIC_RATE) - 0.5  # "Rocky" itself, just before
     _, text = _listen(mic, CONTINUE_WAIT_S, seed=seed)
+    _heard_window[:] = [said_from, max(_heard_window[1], woke_at)]  # the name, and whatever followed it
+    _heard_heading[0] = woke_heading
     if not text and seed and _whisper is not None:
         # Nothing MORE was said -- but said in one breath ("Rocky wake up", "Rocky
         # what time is it"), the whole phrase is already in `seed`: Vosk only
@@ -786,8 +840,9 @@ def _on_wake(persona, Reply, mic: mic_stream.ArecordStream, seed: bytes) -> None
             _wake_up(persona, mic)
         return
     instruction = [w for w in words if w not in fillers]
-    if not instruction:  # with one, _run_turn logs it
+    if not instruction:  # with one, _run_turn logs it (and faces them)
         dash_events.log_event("wake", f"user: {text or _wake_name(persona)}")
+        _toward_voice(*_heard_window)
     _run_session(persona, Reply, mic, first_text=text if instruction else None)
 
 

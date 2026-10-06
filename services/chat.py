@@ -48,6 +48,7 @@ import common.system  # noqa: F401 -- os.getlogin shim: config's picarx import n
 import config as cfg  # noqa: E402
 from common import cognition, events as dash_events, health, journal, memory, persona as persona_mod  # noqa: E402
 from common import agenda, contacts, outcomes, reply_schema, sensors, skills, state, vision  # noqa: E402
+from skills.pause_texting import pause_texting  # noqa: E402
 from neonize.client import NewClient  # noqa: E402
 from neonize.events import ConnectedEv, DisconnectedEv, LoggedOutEv, MessageEv  # noqa: E402
 from neonize.utils.jid import Jid2String, build_jid  # noqa: E402
@@ -154,6 +155,9 @@ def reply_to(persona, Reply, ctx: dict, text: str, history: list[dict], sent: by
                                      "Someone just texted you on WhatsApp.", body + camera + questions, text,
                                      history, book)
     did = [r for a in actions if (r := skills.attempt(a, ctx))] + [skills.refusal(book[n], "text") for n in refused]
+    minutes = pause_texting.asked(text)  # a plain "stop texting me" holds even when the decision missed the skill
+    if minutes is not None and not any(a.skill == "pause_texting" for a in actions):
+        did.append(skills.use("pause_texting", ctx, {"minutes": minutes}, book) or "")
 
     if known:
         turn = f"{who} is texting you on WhatsApp -- they may not be with you, and can't see your gestures. "
@@ -166,7 +170,7 @@ def reply_to(persona, Reply, ctx: dict, text: str, history: list[dict], sent: by
     turn += ("Text back like a friend would: short. Texts are casual -- short forms and typos (\"der\" is "
              "\"there\", \"u\" is \"you\"), and a short text usually answers your own last one.\n")
     done = ("What you did about their message: " + " ".join(did) if did else
-            "You did nothing about their message -- don't say you're doing anything.")
+            "You did nothing about their message -- don't say you're doing anything, or about to.")
     turn += camera + body + done + f"\n\nTheir message: {text}"
     _, reply, raw = _ask(persona, Reply, turn, text, history, sent or photo, done)
     if raw:
@@ -243,15 +247,26 @@ def _outcome(info: dict, outcome: str, **fields) -> None:
                     sent_ts=info["sent_ts"], **fields)
 
 
-def _replied(number: str) -> None:
-    """A message from them answers the texts it sent them that weren't answered yet."""
+def _replied(number: str, heard_ts: float | None = None, stopped: bool = False) -> None:
+    """A message from them answers the newest text it sent them and hadn't heard back on; any
+    older ones it was still waiting on got no reply (one answer answers one text, not five).
+    `stopped`: their message asked it to stop texting -- that text's outcome, not a reply."""
     with _sent_lock:
-        waiting = [i for i in _sent.values() if i["number"] == number and not i["answered"]]
-        for info in waiting:
+        waiting = sorted(((k, i) for k, i in _sent.items() if i["number"] == number and not i["answered"]),
+                         key=lambda kv: kv[1]["sent_ts"])
+        for k, info in waiting:
             info["answered"] = True
-    for info in waiting:
-        after = time.time() - info["sent_ts"]
-        _outcome(info, outcomes.reply_words(after), replied=True, after_s=round(after))
+        for k, _ in waiting[:-1]:
+            del _sent[k]
+    for _, info in waiting[:-1]:
+        _outcome(info, outcomes.reply_words(None), replied=False)
+    if waiting:
+        info = waiting[-1][1]
+        if stopped:
+            _outcome(info, outcomes.STOP_WORDS, replied=False)
+        else:
+            after = (heard_ts or time.time()) - info["sent_ts"]
+            _outcome(info, outcomes.reply_words(after), replied=True, after_s=round(after))
 
 
 def _reacted(message_id: str, emoji: str) -> None:
@@ -275,8 +290,9 @@ def _sweep() -> None:
 
 def _answer(client: NewClient, persona, Reply, histories: dict, chat, pushname: str, number: str, text: str,
             image_msg) -> None:
-    state.update_session({"chat_last_heard_ts": time.time()})  # the mind's texting decision sees it
-    _replied(number)
+    heard_ts = time.time()
+    state.update_session({"chat_last_heard_ts": heard_ts})  # the mind's texting decision sees it
+    state.reset_text_floor(number)  # they're answering: no more backing off from them
     sent = as_jpeg(client.download_any(image_msg)) if image_msg else None
     if sent:
         text = f"[sent you a photo] {text}".strip()
@@ -288,6 +304,7 @@ def _answer(client: NewClient, persona, Reply, histories: dict, chat, pushname: 
     ctx = {"channel": "text", "who": who, "number": number}
     reply, photo, actions, refused = reply_to(persona, Reply, ctx, text, histories.setdefault(number, []), sent,
                                               known=bool(name))
+    _replied(number, heard_ts, stopped=bool(ctx.get("texting_paused")))
     if actions or refused:
         dash_events.log_event("reply", f"WhatsApp skills: used {[a.skill for a in actions]}"
                               + (f", can't by text: {refused}" if refused else ""))
@@ -446,6 +463,17 @@ def demo() -> None:
         _sent["m2"]["sent_ts"] -= outcomes.REPLY_WINDOW_S + 1
         _sweep()
         assert calls[-1][0] == "Atul: no reply" and "m2" not in _sent and "m1" in _sent
+        _sent.clear(); calls.clear()
+        _sent_text("m3", me, "Door's open", False, "jev", 1.0)  # two texts, one answer: one replied, one not
+        _sent_text("m4", me, "Still open", False, "jev", 2.0)
+        _sent["m3"]["sent_ts"] -= 700
+        _replied(me, time.time())
+        assert [(c[0], c[1]["replied"]) for c in calls] == [("Atul: no reply", False), ("Atul: replied right away", True)]
+        assert "m3" not in _sent and _sent["m4"]["answered"]
+        _sent_text("m5", me, "Chair moved", False, "jev", 3.0)
+        _replied(me, stopped=True)  # their answer ran pause_texting
+        assert calls[-1] == ("Atul: asked me to stop texting", {"kind": "jev", "decided_ts": 3.0,
+                                                                "sent_ts": _sent["m5"]["sent_ts"], "replied": False})
     finally:
         outcomes.record, contacts.name_of = real
         _sent.clear()
@@ -457,6 +485,11 @@ def demo() -> None:
     acts, refused = skills.read_decision('{"actions": [{"skill": "pause_texting", "minutes": 60}, {"skill": '
                                          '"send_photo"}, {"skill": "move", "how": "forward"}]}', "text", True, book)
     assert [a.skill for a in acts] == ["pause_texting", "send_photo"] and refused == ["move"]
+    assert pause_texting.asked("Stop texting me for 1 hour") == 60 and pause_texting.asked("don't text me") == 240
+    assert pause_texting.asked("No more messages for 30 min please") == 30 and pause_texting.asked("stop") is None
+    assert pause_texting.asked("Please stop the car") is None and pause_texting.asked("I'll text you later") is None
+    assert pause_texting.asked("I don't text much") is None and pause_texting.asked("Why did you stop texting me?") is None
+    assert pause_texting.asked("Rocky, stop texting me") == 240 and pause_texting.asked("ok please stop messaging me") == 240
     assert "move(how)" in skills.menu(True, book) and "move(" not in skills.menu(False, book)
 
 
